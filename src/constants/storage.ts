@@ -1,0 +1,5 @@
+export const HISTORY_STORAGE_KEY = "live-conversation-history";
+export const CHANNEL_STORAGE_KEY = "live-conversation-channels";
+export const SELECTED_CHANNEL_KEY = "live-conversation-selected-channel";
+export const SHOW_TRANSLATION_ALTERNATIVES_KEY = "live-show-translation-alternatives";
+export const HISTORY_LIMIT = 40;

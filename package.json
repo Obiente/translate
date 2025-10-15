@@ -1,0 +1,35 @@
+{
+  "name": "vue-translation-app",
+  "version": "1.0.0",
+  "description": "A Vue.js translation app with audio input and Google Translate API",
+  "main": "index.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc && vite build",
+    "preview": "vite preview",
+    "serve": "vite preview",
+    "type-check": "vue-tsc --noEmit"
+  },
+  "packageManager": "pnpm@10.12.1",
+  "dependencies": {
+    "@vueuse/core": "^11.3.0",
+    "axios": "^1.12.2",
+    "vue": "^3.5.22"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.4",
+    "vite": "^5.4.20",
+    "typescript": "^5.6.0",
+    "vue-tsc": "^2.1.0",
+    "@types/node": "^22.0.0"
+  },
+  "keywords": [
+    "vue",
+    "translation",
+    "google-translate",
+    "audio",
+    "speech-to-text"
+  ],
+  "author": "Your Name",
+  "license": "MIT"
+}

@@ -1,0 +1,17 @@
+export const SPEECH_LOCALES: Record<string, string> = {
+  en: "en-US",
+  es: "es-ES",
+  fr: "fr-FR",
+  de: "de-DE",
+  it: "it-IT",
+  pt: "pt-PT",
+  ru: "ru-RU",
+  ja: "ja-JP",
+  ko: "ko-KR",
+  zh: "zh-CN",
+  ar: "ar-SA",
+  hi: "hi-IN",
+  nl: "nl-NL",
+  sv: "sv-SE",
+  pl: "pl-PL",
+};
