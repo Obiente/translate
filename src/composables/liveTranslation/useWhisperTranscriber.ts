@@ -61,7 +61,7 @@ export const useWhisperTranscriber = (
         onTranscription,
         updateStatus,
         endpoint,
-        chunkIntervalMs = 2000,
+        chunkIntervalMs = 5000,
     } = options;
 
     const recorders = new Map<string, RecorderEntry>();
