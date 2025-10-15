@@ -259,6 +259,34 @@ export const useLiveTranslation = () => {
         channel.targetLanguages = [fallback.code];
       }
     }
+
+    const whitelist = new Set(channel.targetLanguages);
+    const liveEntries = Object.keys(channel.liveTranslations);
+    const historicalEntries = Object.keys(channel.translations);
+    if (liveEntries.some((code) => !whitelist.has(code))) {
+      channel.liveTranslations = liveEntries.reduce<Record<string, string>>(
+        (acc, code) => {
+          if (whitelist.has(code)) {
+            acc[code] = channel.liveTranslations[code];
+          }
+          return acc;
+        },
+        {},
+      );
+    }
+    if (historicalEntries.some((code) => !whitelist.has(code))) {
+      channel.translations = historicalEntries.reduce<
+        Record<string, TranslationEntry>
+      >(
+        (acc, code) => {
+          if (whitelist.has(code)) {
+            acc[code] = channel.translations[code];
+          }
+          return acc;
+        },
+        {},
+      );
+    }
   };
 
   const clearLiveTranslationSchedule = (channelId: string): void => {
