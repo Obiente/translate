@@ -1,6 +1,10 @@
 import type { ConversationChannel, StatusType } from "../../types/conversation";
 import type { WhisperTranscriberManager } from "./useWhisperTranscriber";
 const DEFAULT_CHUNK_INTERVAL_MS = 750;  // Mirror original tuning; focus on logical fixes rather than extreme chunking
+const DEFAULT_KEEPALIVE_INTERVAL_MS = 15000;
+const DEFAULT_KEEPALIVE_TIMEOUT_MS = 45000;
+const RECONNECT_BASE_DELAY_MS = 500;
+const RECONNECT_MAX_DELAY_MS = 15000;
 
 type EnsureStreamFn = (channel: ConversationChannel) => Promise<MediaStream>;
 
@@ -42,6 +46,10 @@ interface StreamingState {
     chunkTimer: number | null;
     audioBuffer: Float32Array[];
     sampleRate: number;
+    keepaliveTimer: number | null;
+    lastKeepaliveAt: number;
+    reconnectAttempts: number;
+    reconnectTimer: number | null;
 }
 
 // Removed resampleTo16kHz - server will handle resampling with ffmpeg for better quality
@@ -148,6 +156,20 @@ export const useStreamingWhisperTranscriber = (
 
     const states = new Map<string, StreamingState>();
 
+    const clearKeepalive = (state: StreamingState): void => {
+        if (state.keepaliveTimer !== null) {
+            clearInterval(state.keepaliveTimer);
+            state.keepaliveTimer = null;
+        }
+    };
+
+    const clearReconnect = (state: StreamingState): void => {
+        if (state.reconnectTimer !== null) {
+            clearTimeout(state.reconnectTimer);
+            state.reconnectTimer = null;
+        }
+    };
+
     const cleanupState = (channelId: string, state: StreamingState): void => {
         if (state.cleanedUp) {
             return;
@@ -159,6 +181,9 @@ export const useStreamingWhisperTranscriber = (
             clearInterval(state.chunkTimer);
             state.chunkTimer = null;
         }
+
+        clearKeepalive(state);
+        clearReconnect(state);
 
         // Stop audio processing
         if (state.processor) {
@@ -186,6 +211,54 @@ export const useStreamingWhisperTranscriber = (
             }
         }
         states.delete(channelId);
+    };
+
+    const scheduleReconnect = (state: StreamingState): void => {
+        if (state.isClosing || state.cleanedUp) {
+            return;
+        }
+
+        if (state.reconnectTimer !== null) {
+            return;
+        }
+
+        const delay = Math.min(
+            RECONNECT_BASE_DELAY_MS * 2 ** state.reconnectAttempts,
+            RECONNECT_MAX_DELAY_MS,
+        );
+
+        state.reconnectAttempts += 1;
+        state.reconnectTimer = window.setTimeout(() => {
+            state.reconnectTimer = null;
+            void connectWebSocket(state).catch((error) => {
+                console.warn("Streaming reconnect attempt failed", error);
+                scheduleReconnect(state);
+            });
+        }, delay);
+    };
+
+    const startKeepalive = (state: StreamingState): void => {
+        clearKeepalive(state);
+        state.lastKeepaliveAt = Date.now();
+        state.keepaliveTimer = window.setInterval(() => {
+            const socket = state.websocket;
+            if (!socket || socket.readyState !== WebSocket.OPEN) {
+                return;
+            }
+
+            const now = Date.now();
+            if (now - state.lastKeepaliveAt >= DEFAULT_KEEPALIVE_TIMEOUT_MS) {
+                console.warn("Streaming keepalive timed out; forcing reconnect");
+                try {
+                    socket.close();
+                } catch (error) {
+                    console.warn("Failed to close stale websocket", error);
+                }
+                return;
+            }
+
+            sendJson(socket, { type: "ping", ts: now });
+        }, DEFAULT_KEEPALIVE_INTERVAL_MS);
     };
 
     const createAudioProcessor = (
@@ -233,6 +306,23 @@ export const useStreamingWhisperTranscriber = (
         state: StreamingState,
         isFinal: boolean,
     ): void => {
+        const socketOpen =
+            !!state.websocket &&
+            state.websocket.readyState === WebSocket.OPEN;
+
+        if (!socketOpen && !isFinal) {
+            return;
+        }
+
+        if (!socketOpen && isFinal) {
+            state.audioBuffer = [];
+            if (!state.finalChunkSent) {
+                state.finalChunkSent = true;
+                state.finalResolvers.splice(0).forEach((resolve) => resolve());
+            }
+            return;
+        }
+
         if (state.audioBuffer.length === 0 && !isFinal) {
             return;
         }
@@ -339,6 +429,19 @@ export const useStreamingWhisperTranscriber = (
             return;
         }
 
+        if (payload?.type === "pong") {
+            state.lastKeepaliveAt = Date.now();
+            return;
+        }
+
+        if (payload?.type === "ping") {
+            const socket = state.websocket;
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                sendJson(socket, { type: "pong", ts: payload?.ts });
+            }
+            return;
+        }
+
         if (payload?.type !== "transcript") {
             return;
         }
@@ -360,6 +463,93 @@ export const useStreamingWhisperTranscriber = (
         } catch (error) {
             console.error("Streaming transcription callback failed", error);
         }
+    };
+
+    const attachSocketHandlers = (state: StreamingState, socket: WebSocket) => {
+        socket.addEventListener("message", (event) => {
+            if (state.websocket !== socket) {
+                return;
+            }
+            void handleMessage(state, event.data);
+        });
+
+        socket.addEventListener("close", () => {
+            if (state.websocket !== socket) {
+                return;
+            }
+
+            clearKeepalive(state);
+
+            if (state.isClosing || state.cleanedUp) {
+                cleanupState(state.channel.id, state);
+                return;
+            }
+
+            state.websocket = null;
+            updateStatus(state.channel, "Streaming connection lost. Reconnecting…", "processing");
+            scheduleReconnect(state);
+        });
+
+        socket.addEventListener("error", (event) => {
+            if (state.websocket !== socket) {
+                return;
+            }
+            console.error("Streaming websocket error", event);
+            updateStatus(state.channel, "Streaming connection error.", "error");
+        });
+    };
+
+    const connectWebSocket = async (state: StreamingState): Promise<void> => {
+        if (state.cleanedUp || state.isClosing) {
+            return;
+        }
+
+        clearReconnect(state);
+
+        const websocket = new WebSocket(endpoint);
+        state.websocket = websocket;
+        state.sequence = 0;
+        state.finalChunkSent = false;
+
+        const openPromise = new Promise<void>((resolve, reject) => {
+            const handleOpen = () => {
+                websocket.removeEventListener("open", handleOpen);
+                websocket.removeEventListener("error", handleError);
+                resolve();
+            };
+            const handleError = () => {
+                websocket.removeEventListener("open", handleOpen);
+                websocket.removeEventListener("error", handleError);
+                reject(
+                    new Error(
+                        "Failed to establish streaming transcription connection",
+                    ),
+                );
+            };
+
+            websocket.addEventListener("open", handleOpen);
+            websocket.addEventListener("error", handleError);
+        });
+
+        attachSocketHandlers(state, websocket);
+
+        await openPromise;
+
+        state.reconnectAttempts = 0;
+        state.lastKeepaliveAt = Date.now();
+        startKeepalive(state);
+
+        const payload: Record<string, unknown> = {
+            type: "start",
+            channel_id: state.channel.id,
+        };
+
+        if (state.channel.sourceLanguage && state.channel.sourceLanguage !== "auto") {
+            payload.language = state.channel.sourceLanguage;
+        }
+
+        sendJson(websocket, payload);
+        updateStatus(state.channel, "Listening…", "listening");
     };
 
     const start = async (channel: ConversationChannel): Promise<void> => {
@@ -384,14 +574,12 @@ export const useStreamingWhisperTranscriber = (
         }
 
         const audioStream = cloneAudioStream(sourceStream);
-        const websocket = new WebSocket(endpoint);
-
         const state: StreamingState = {
             channel,
             stream: audioStream,
             audioContext: null,
             processor: null,
-            websocket,
+            websocket: null,
             sequence: 0,
             pending: Promise.resolve(),
             isClosing: false,
@@ -401,66 +589,28 @@ export const useStreamingWhisperTranscriber = (
             chunkTimer: null,
             audioBuffer: [],
             sampleRate: 44100, // Default, will be updated when audio context is created
+            keepaliveTimer: null,
+            lastKeepaliveAt: Date.now(),
+            reconnectAttempts: 0,
+            reconnectTimer: null,
         };
 
         states.set(channel.id, state);
 
-        const openPromise = new Promise<void>((resolve, reject) => {
-            const handleOpen = () => {
-                websocket.removeEventListener("open", handleOpen);
-                websocket.removeEventListener("error", handleError);
-                resolve();
-            };
-            const handleError = () => {
-                websocket.removeEventListener("open", handleOpen);
-                websocket.removeEventListener("error", handleError);
-                reject(
-                    new Error(
-                        "Failed to establish streaming transcription connection",
-                    ),
-                );
-            };
-
-            websocket.addEventListener("open", handleOpen);
-            websocket.addEventListener("error", handleError);
-        });
-
-        websocket.addEventListener("message", (event) => {
-            void handleMessage(state, event.data);
-        });
-
-        websocket.addEventListener("close", () => {
-            if (!state.cleanedUp && !state.isClosing) {
-                updateStatus(channel, "Streaming connection closed.", "error");
-            }
-            cleanupState(channel.id, state);
-        });
-
-        websocket.addEventListener("error", (event) => {
-            console.error("Streaming websocket error", event);
-            updateStatus(channel, "Streaming connection error.", "error");
-        });
-
-        await openPromise;
-
-        const payload: Record<string, unknown> = {
-            type: "start",
-            channel_id: channel.id,
-        };
-
-        if (channel.sourceLanguage && channel.sourceLanguage !== "auto") {
-            payload.language = channel.sourceLanguage;
-        }
-
-        sendJson(websocket, payload);
-
         channel.liveTranscript = "";
-        updateStatus(channel, "Listening…", "listening");
 
         try {
             createAudioProcessor(channel, audioStream, state);
         } catch (error) {
             cleanupState(channel.id, state);
+            throw error;
+        }
+
+        try {
+            await connectWebSocket(state);
+        } catch (error) {
+            console.error("Initial streaming websocket connection failed", error);
+            scheduleReconnect(state);
             throw error;
         }
     };
