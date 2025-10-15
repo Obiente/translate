@@ -24,6 +24,7 @@ export interface ConversationChannel {
   sourceLanguage: string;
   targetLanguages: string[];
   liveTranscript: string;
+  liveTranslations: Record<string, string>;
   lastFinalTranscript: string;
   translations: Record<string, TranslationEntry>;
   detectedLanguage: string | null;

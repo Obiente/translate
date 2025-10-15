@@ -61,7 +61,7 @@ export const useWhisperTranscriber = (
         onTranscription,
         updateStatus,
         endpoint,
-        chunkIntervalMs = 4000,
+        chunkIntervalMs = 2000,
     } = options;
 
     const recorders = new Map<string, RecorderEntry>();
@@ -70,6 +70,7 @@ export const useWhisperTranscriber = (
     const chunkTimers = new Map<string, ReturnType<typeof setTimeout>>();
     const mimeType = resolveMimeType();
     const previousTranscripts = new Map<string, string>();
+    const sequenceCounters = new Map<string, number>();
 
     const enqueue = async (channel: ConversationChannel, blob: Blob) => {
         if (!blob || blob.size === 0) {
@@ -174,10 +175,15 @@ export const useWhisperTranscriber = (
                     const normalizedDelta = delta.trim();
 
                     if (normalizedDelta.length > 0) {
+                        const nextSequence =
+                            (sequenceCounters.get(channel.id) ?? 0) + 1;
+                        sequenceCounters.set(channel.id, nextSequence);
                         await onTranscription(channel, {
                             text: normalizedDelta,
                             fullText,
                             language,
+                            isFinal: true,
+                            sequence: nextSequence,
                         });
                         updateStatus(channel, "Listening…", "listening");
                     } else {
@@ -378,6 +384,7 @@ export const useWhisperTranscriber = (
         recorders.set(channel.id, entry);
         activeChannels.add(channel.id);
         previousTranscripts.delete(channel.id);
+    sequenceCounters.set(channel.id, 0);
 
         updateStatus(channel, "Listening…", "listening");
         channel.liveTranscript = "";
@@ -397,6 +404,7 @@ export const useWhisperTranscriber = (
         activeChannels.delete(channelId);
         clearChunkTimer(channelId);
         previousTranscripts.delete(channelId);
+        sequenceCounters.delete(channelId);
         await stopRecorder(channelId);
         await flushQueue(channelId);
     };
@@ -407,6 +415,7 @@ export const useWhisperTranscriber = (
         entry?.stream.getTracks().forEach((track) => track.stop());
         recorders.delete(channelId);
         previousTranscripts.delete(channelId);
+        sequenceCounters.delete(channelId);
     };
 
     const stopAll = async (): Promise<void> => {
@@ -418,6 +427,7 @@ export const useWhisperTranscriber = (
         chunkTimers.forEach((timer) => clearTimeout(timer));
         chunkTimers.clear();
         previousTranscripts.clear();
+        sequenceCounters.clear();
     };
 
     return {

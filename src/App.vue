@@ -39,6 +39,20 @@
           </button>
         </div>
 
+        <div class="mode-control">
+          <label for="transcription-mode">Transcription mode</label>
+          <select id="transcription-mode" v-model="transcriptionMode">
+            <option value="chunked">Chunked uploads (stable)</option>
+            <option value="streaming">Streaming (beta)</option>
+          </select>
+          <p class="mode-hint">
+            Chunked uploads send periodic audio blobs. Streaming keeps a live WebSocket open for lower latency.
+          </p>
+          <p class="mode-hint warning" v-if="isAnyChannelActive">
+            Active participants continue using their current mode until restarted.
+          </p>
+        </div>
+
         <p v-if="!speechSupported" class="support-hint">
           Audio capture is unavailable in this browser.
         </p>
@@ -260,6 +274,20 @@
             </label>
           </div>
           <div
+            class="live-translation-preview"
+            v-if="Object.keys(selectedChannel.liveTranslations).length"
+          >
+            <h4>Live preview</h4>
+            <ul>
+              <li
+                v-for="(translation, code) in selectedChannel.liveTranslations"
+                :key="code"
+              >
+                <strong>{{ getLanguageName(code) }}:</strong> {{ translation }}
+              </li>
+            </ul>
+          </div>
+          <div
             class="translation-list"
             v-if="Object.keys(selectedChannel.translations).length"
           >
@@ -283,7 +311,12 @@
               </ul>
             </div>
           </div>
-          <p v-else class="placeholder">No translations yet.</p>
+          <p
+            v-else-if="!Object.keys(selectedChannel.liveTranslations).length"
+            class="placeholder"
+          >
+            No translations yet.
+          </p>
         </section>
       </div>
 
@@ -320,6 +353,18 @@
           </div>
 
           <ul
+            class="overview-translations live"
+            v-if="Object.keys(channel.liveTranslations).length"
+          >
+            <li
+              v-for="(translation, code) in channel.liveTranslations"
+              :key="code"
+            >
+              <strong>{{ getLanguageName(code) }} (live):</strong> {{ translation }}
+            </li>
+          </ul>
+
+          <ul
             class="overview-translations"
             v-if="Object.keys(channel.translations).length"
           >
@@ -338,7 +383,12 @@
               </ul>
             </li>
           </ul>
-          <p v-else class="placeholder">No translations yet.</p>
+          <p
+            v-else-if="!Object.keys(channel.liveTranslations).length"
+            class="placeholder"
+          >
+            No translations yet.
+          </p>
         </article>
       </div>
     </section>
@@ -386,9 +436,11 @@ const {
   recentHistory,
   globalStatus,
   showTranslationAlternatives,
+  transcriptionMode,
   speechSupported,
   desktopCaptureSupported,
   hasSystemChannel,
+  isAnyChannelActive,
   isSpeaking,
   audioInputOptions,
   isRefreshingAudioInputs,
@@ -412,9 +464,11 @@ defineExpose({
   recentHistory,
   globalStatus,
   showTranslationAlternatives,
+  transcriptionMode,
   speechSupported,
   desktopCaptureSupported,
   hasSystemChannel,
+  isAnyChannelActive,
   isSpeaking,
   audioInputOptions,
   isRefreshingAudioInputs,
@@ -490,6 +544,23 @@ defineExpose({
     display: flex;
     flex-direction: column;
     gap: 0.5rem;
+  }
+
+  .mode-control {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-top: 0.75rem;
+  }
+
+  .mode-hint {
+    font-size: 0.85rem;
+    color: #b0b0b0;
+    margin: 0;
+  }
+
+  .mode-hint.warning {
+    color: #ffb74d;
   }
 
   .support-hint {
@@ -709,6 +780,30 @@ defineExpose({
     gap: 0.75rem;
   }
 
+  .live-translation-preview {
+    background: rgba(0, 0, 0, 0.25);
+    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    padding: 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .live-translation-preview h4 {
+    margin: 0;
+    font-size: 1rem;
+    color: #dcdcff;
+  }
+
+  .live-translation-preview ul {
+    margin: 0;
+    padding-left: 0;
+    list-style: none;
+    display: grid;
+    gap: 0.4rem;
+  }
+
   .translations-header {
     display: flex;
     justify-content: space-between;
@@ -806,6 +901,10 @@ defineExpose({
     padding: 0;
     display: grid;
     gap: 0.4rem;
+  }
+
+  .overview-translations.live {
+    opacity: 0.85;
   }
 
   .tts-indicator {

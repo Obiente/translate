@@ -6,31 +6,42 @@ import {
   HISTORY_STORAGE_KEY,
   SELECTED_CHANNEL_KEY,
   SHOW_TRANSLATION_ALTERNATIVES_KEY,
+  TRANSCRIPTION_MODE_KEY,
 } from "../constants/storage";
 import { useAudioCapture } from "../composables/useAudioCapture";
 import { useSpeechSynthesis } from "../composables/useSpeechSynthesis";
 import { useTranslationService } from "../composables/useTranslationService";
 import { useMicrophoneManager } from "../composables/liveTranslation/useMicrophoneManager";
 import { useWhisperTranscriber } from "./liveTranslation/useWhisperTranscriber";
+import type { WhisperTranscriberManager } from "./liveTranslation/useWhisperTranscriber";
+import { useStreamingWhisperTranscriber } from "./liveTranslation/useStreamingWhisperTranscriber";
 import type {
   ConversationChannel,
   ConversationHistoryEntry,
   LanguageOption,
-  TranslationEntry,
   StatusMessage,
   StatusType,
+  TranslationEntry,
 } from "../types/conversation";
 
 interface FinalTranscriptPayload {
   fullText?: string;
   deltaText: string;
+  isFinal: boolean;
 }
 
 const DEFAULT_WHISPER_ENDPOINT = "https://whisper.obiente.cloud/transcribe";
-const WHISPER_ENDPOINT = (
+const WHISPER_ENDPOINT =
   (import.meta.env.VITE_WHISPER_ENDPOINT as string | undefined)?.trim() ||
-  DEFAULT_WHISPER_ENDPOINT
-);
+  DEFAULT_WHISPER_ENDPOINT;
+const DEFAULT_WHISPER_STREAMING_ENDPOINT =
+  "wss://whisper.obiente.cloud/ws/transcribe";
+const WHISPER_STREAMING_ENDPOINT =
+  (import.meta.env.VITE_WHISPER_STREAMING_ENDPOINT as string | undefined)
+    ?.trim() ||
+  DEFAULT_WHISPER_STREAMING_ENDPOINT;
+
+type TranscriptionMode = "chunked" | "streaming";
 
 const createId = (): string =>
   typeof crypto !== "undefined" && "randomUUID" in crypto
@@ -45,7 +56,7 @@ const createChannel = (
   autoSpeak = true,
   id?: string,
   microphoneDeviceId?: string | null,
-  microphoneDeviceLabel?: string | null
+  microphoneDeviceLabel?: string | null,
 ): ConversationChannel => ({
   id: id ?? createId(),
   label,
@@ -53,6 +64,7 @@ const createChannel = (
   sourceLanguage,
   targetLanguages,
   liveTranscript: "",
+  liveTranslations: {},
   lastFinalTranscript: "",
   translations: {},
   detectedLanguage: null,
@@ -72,11 +84,16 @@ export const useLiveTranslation = () => {
   const conversationHistory = ref<ConversationHistoryEntry[]>([]);
   const globalStatus = ref<StatusMessage | null>(null);
   const showTranslationAlternatives = ref<boolean>(false);
+  const transcriptionMode = ref<TranscriptionMode>("streaming");
   const speechSupported = ref<boolean>(
     typeof window !== "undefined" &&
       typeof MediaRecorder !== "undefined" &&
-      !!navigator.mediaDevices?.getUserMedia
+      !!navigator.mediaDevices?.getUserMedia,
   );
+
+  const LIVE_TRANSLATION_DEBOUNCE_MS = 450;
+  const liveTranslationTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const liveTranslationRequests = new Map<string, symbol>();
 
   const { translateText, getSupportedLanguages } = useTranslationService();
   const {
@@ -96,32 +113,36 @@ export const useLiveTranslation = () => {
   const setChannelStatus = (
     channel: ConversationChannel,
     message: string,
-    type: StatusType
+    type: StatusType,
   ) => {
     channel.status = { message, type };
   };
-  const transcriptionManager = useWhisperTranscriber({
-    ensureStream: async (channel) => {
-      if (channel.sourceType === "microphone") {
-        await microphoneManager.ensureStream(channel);
-        if (!channel.microphoneStream) {
-          throw new Error("Microphone stream unavailable");
-        }
-        return channel.microphoneStream;
+  const resolveTranscriptionStream = async (
+    channel: ConversationChannel,
+  ): Promise<MediaStream> => {
+    if (channel.sourceType === "microphone") {
+      await microphoneManager.ensureStream(channel);
+      if (!channel.microphoneStream) {
+        throw new Error("Microphone stream unavailable");
       }
+      return channel.microphoneStream;
+    }
 
-      if (channel.sourceType === "system") {
-        if (!channel.systemStream) {
-          throw new Error("System audio stream unavailable");
-        }
-        return channel.systemStream;
+    if (channel.sourceType === "system") {
+      if (!channel.systemStream) {
+        throw new Error("System audio stream unavailable");
       }
+      return channel.systemStream;
+    }
 
-      throw new Error("Unsupported channel type");
-    },
+    throw new Error("Unsupported channel type");
+  };
+
+  const chunkedTranscriptionManager = useWhisperTranscriber({
+    ensureStream: resolveTranscriptionStream,
     updateStatus: setChannelStatus,
     endpoint: WHISPER_ENDPOINT,
-    onTranscription: async (channel, { text, language, fullText }) => {
+    onTranscription: async (channel, { text, language, fullText, isFinal }) => {
       if (language) {
         channel.detectedLanguage = language;
       }
@@ -132,12 +153,66 @@ export const useLiveTranslation = () => {
           ? `${channel.liveTranscript} ${text}`.trim()
           : text;
       }
-      await handleFinalTranscript(channel, {
-        fullText,
-        deltaText: text,
-      });
+        const previewText = fullText?.trim()?.length
+          ? fullText
+          : channel.liveTranscript;
+
+        if (isFinal) {
+          resetLiveTranslations(channel);
+        } else if (previewText && previewText.trim().length > 0) {
+          scheduleLiveTranslation(channel, previewText);
+        }
+
+        await handleFinalTranscript(channel, {
+          fullText,
+          deltaText: text,
+          isFinal: isFinal ?? true,
+        });
     },
   });
+
+  const streamingTranscriptionManager = useStreamingWhisperTranscriber({
+    ensureStream: resolveTranscriptionStream,
+    updateStatus: setChannelStatus,
+    endpoint: WHISPER_STREAMING_ENDPOINT,
+    onTranscription: async (channel, { text, language, fullText, isFinal }) => {
+      if (language) {
+        channel.detectedLanguage = language;
+      }
+      if (fullText && fullText.length > 0) {
+        channel.liveTranscript = fullText;
+      } else if (text.length > 0) {
+        channel.liveTranscript = channel.liveTranscript
+          ? `${channel.liveTranscript} ${text}`.trim()
+          : text;
+      }
+        const previewText = fullText?.trim()?.length
+          ? fullText
+          : channel.liveTranscript;
+
+        if (isFinal) {
+          resetLiveTranslations(channel);
+        } else if (previewText && previewText.trim().length > 0) {
+          scheduleLiveTranslation(channel, previewText);
+        }
+
+        await handleFinalTranscript(channel, {
+          fullText,
+          deltaText: text,
+          isFinal: isFinal ?? false,
+        });
+    },
+  });
+
+  const transcriptionManagers: Record<
+    TranscriptionMode,
+    WhisperTranscriberManager
+  > = {
+    chunked: chunkedTranscriptionManager,
+    streaming: streamingTranscriptionManager,
+  };
+
+  const activeTranscriptionModes = new Map<string, TranscriptionMode>();
 
   let statusTimeout: number | undefined;
   let channelPersistenceReady = false;
@@ -147,13 +222,17 @@ export const useLiveTranslation = () => {
     channels.value.some((channel) => channel.sourceType === "system")
   );
   const desktopCaptureSupported = computed(
-    () => support.value.getDisplayMedia
+    () => support.value.getDisplayMedia,
   );
   const recentHistory = computed(() =>
     [...conversationHistory.value].slice(-10).reverse()
   );
   const selectedChannel = computed(() =>
-    channels.value.find((channel) => channel.id === selectedChannelId.value) ?? null
+    channels.value.find((channel) => channel.id === selectedChannelId.value) ??
+      null
+  );
+  const isAnyChannelActive = computed(() =>
+    channels.value.some((channel) => channel.isActive)
   );
 
   const setGlobalStatus = (message: string, type: StatusType): void => {
@@ -174,12 +253,99 @@ export const useLiveTranslation = () => {
   const ensureTargets = (channel: ConversationChannel): void => {
     if (channel.targetLanguages.length === 0) {
       const fallback = languages.value.find(
-        (lang) => lang.code !== channel.sourceLanguage
+        (lang) => lang.code !== channel.sourceLanguage,
       );
       if (fallback) {
         channel.targetLanguages = [fallback.code];
       }
     }
+  };
+
+  const clearLiveTranslationSchedule = (channelId: string): void => {
+    const timer = liveTranslationTimers.get(channelId);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      liveTranslationTimers.delete(channelId);
+    }
+    liveTranslationRequests.delete(channelId);
+  };
+
+  const resetLiveTranslations = (channel: ConversationChannel): void => {
+    clearLiveTranslationSchedule(channel.id);
+    if (Object.keys(channel.liveTranslations).length > 0) {
+      channel.liveTranslations = {};
+    }
+  };
+
+  const scheduleLiveTranslation = (
+    channel: ConversationChannel,
+    text: string,
+  ): void => {
+    const trimmed = text.trim();
+    const channelId = channel.id;
+
+    if (!trimmed || channel.targetLanguages.length === 0) {
+      resetLiveTranslations(channel);
+      return;
+    }
+
+    const existingTimer = liveTranslationTimers.get(channelId);
+    if (existingTimer !== undefined) {
+      clearTimeout(existingTimer);
+    }
+
+    liveTranslationTimers.set(
+      channelId,
+      setTimeout(async () => {
+        liveTranslationTimers.delete(channelId);
+        const requestToken = Symbol(channelId);
+        liveTranslationRequests.set(channelId, requestToken);
+
+        try {
+          ensureTargets(channel);
+          if (channel.targetLanguages.length === 0) {
+            resetLiveTranslations(channel);
+            return;
+          }
+
+          const translationResults = await Promise.all(
+            channel.targetLanguages.map(async (target) => {
+              const result = await translateText(
+                trimmed,
+                channel.sourceLanguage === "auto"
+                  ? "auto"
+                  : channel.sourceLanguage,
+                target,
+              );
+              return {
+                target,
+                primary: result.translatedText.trim(),
+              };
+            }),
+          );
+
+          if (liveTranslationRequests.get(channelId) !== requestToken) {
+            return;
+          }
+
+          const liveUpdates: Record<string, string> = {};
+          translationResults.forEach(({ target, primary }) => {
+            liveUpdates[target] = primary;
+          });
+
+          channel.liveTranslations = {
+            ...channel.liveTranslations,
+            ...liveUpdates,
+          };
+        } catch (error) {
+          console.warn("Live translation update failed", error);
+        } finally {
+          if (liveTranslationRequests.get(channelId) === requestToken) {
+            liveTranslationRequests.delete(channelId);
+          }
+        }
+      }, LIVE_TRANSLATION_DEBOUNCE_MS),
+    );
   };
 
   const ensureSelectedChannel = (): void => {
@@ -188,7 +354,7 @@ export const useLiveTranslation = () => {
       return;
     }
     const exists = channels.value.some(
-      (channel) => channel.id === selectedChannelId.value
+      (channel) => channel.id === selectedChannelId.value,
     );
     if (!exists) {
       selectedChannelId.value = channels.value[0].id;
@@ -215,28 +381,35 @@ export const useLiveTranslation = () => {
     }
 
     const entries = Object.entries(input as Record<string, unknown>);
-    return entries.reduce<Record<string, TranslationEntry>>((acc, [code, value]) => {
-      if (typeof value === "string") {
-        acc[code] = { primary: value, alternatives: [] };
-        return acc;
-      }
-
-      if (value && typeof value === "object") {
-        const primary = typeof (value as { primary?: unknown }).primary === "string"
-          ? (value as { primary?: unknown }).primary as string
-          : "";
-        const alternativesSource = (value as { alternatives?: unknown }).alternatives;
-        const alternatives = Array.isArray(alternativesSource)
-          ? alternativesSource.filter((item): item is string => typeof item === "string")
-          : [];
-
-        if (primary || alternatives.length > 0) {
-          acc[code] = { primary, alternatives };
+    return entries.reduce<Record<string, TranslationEntry>>(
+      (acc, [code, value]) => {
+        if (typeof value === "string") {
+          acc[code] = { primary: value, alternatives: [] };
+          return acc;
         }
-      }
 
-      return acc;
-    }, {});
+        if (value && typeof value === "object") {
+          const primary =
+            typeof (value as { primary?: unknown }).primary === "string"
+              ? (value as { primary?: unknown }).primary as string
+              : "";
+          const alternativesSource =
+            (value as { alternatives?: unknown }).alternatives;
+          const alternatives = Array.isArray(alternativesSource)
+            ? alternativesSource.filter((item): item is string =>
+              typeof item === "string"
+            )
+            : [];
+
+          if (primary || alternatives.length > 0) {
+            acc[code] = { primary, alternatives };
+          }
+        }
+
+        return acc;
+      },
+      {},
+    );
   };
 
   const persistChannels = (): void => {
@@ -279,7 +452,22 @@ export const useLiveTranslation = () => {
         showTranslationAlternatives.value ? "true" : "false",
       );
     } catch (error) {
-      console.warn("Failed to persist translation alternative preference", error);
+      console.warn(
+        "Failed to persist translation alternative preference",
+        error,
+      );
+    }
+  };
+
+  const persistTranscriptionMode = (): void => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    try {
+      localStorage.setItem(TRANSCRIPTION_MODE_KEY, transcriptionMode.value);
+    } catch (error) {
+      console.warn("Failed to persist transcription mode preference", error);
     }
   };
 
@@ -313,7 +501,29 @@ export const useLiveTranslation = () => {
       }
       showTranslationAlternatives.value = raw === "true";
     } catch (error) {
-      console.warn("Failed to restore translation alternative preference", error);
+      console.warn(
+        "Failed to restore translation alternative preference",
+        error,
+      );
+    }
+  };
+
+  const restoreTranscriptionMode = (): void => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    try {
+      const raw = localStorage.getItem(TRANSCRIPTION_MODE_KEY);
+      if (!raw) {
+        return;
+      }
+
+      if (raw === "chunked" || raw === "streaming") {
+        transcriptionMode.value = raw;
+      }
+    } catch (error) {
+      console.warn("Failed to restore transcription mode preference", error);
     }
   };
 
@@ -328,7 +538,9 @@ export const useLiveTranslation = () => {
         return false;
       }
 
-      const parsed = JSON.parse(raw) as Array<ReturnType<typeof serializeChannels>[number]>;
+      const parsed = JSON.parse(raw) as Array<
+        ReturnType<typeof serializeChannels>[number]
+      >;
       if (!Array.isArray(parsed) || parsed.length === 0) {
         return false;
       }
@@ -341,12 +553,14 @@ export const useLiveTranslation = () => {
 
           const targetLanguages = Array.isArray(item.targetLanguages)
             ? item.targetLanguages.filter(
-                (code): code is string =>
-                  typeof code === "string" && code.trim().length > 0
-              )
+              (code): code is string =>
+                typeof code === "string" && code.trim().length > 0,
+            )
             : [];
 
-          const sourceType = item.sourceType === "system" ? "system" : "microphone";
+          const sourceType = item.sourceType === "system"
+            ? "system"
+            : "microphone";
 
           return createChannel(
             sourceType,
@@ -356,7 +570,7 @@ export const useLiveTranslation = () => {
             item.autoSpeak ?? true,
             item.id,
             item.microphoneDeviceId ?? null,
-            item.microphoneDeviceLabel ?? null
+            item.microphoneDeviceLabel ?? null,
           );
         })
         .filter((channel): channel is ConversationChannel => channel !== null);
@@ -377,7 +591,7 @@ export const useLiveTranslation = () => {
     try {
       localStorage.setItem(
         HISTORY_STORAGE_KEY,
-        JSON.stringify(conversationHistory.value)
+        JSON.stringify(conversationHistory.value),
       );
     } catch (error) {
       console.warn("Failed to persist history", error);
@@ -388,7 +602,9 @@ export const useLiveTranslation = () => {
     try {
       const raw = localStorage.getItem(HISTORY_STORAGE_KEY);
       if (!raw) return;
-      const parsed = JSON.parse(raw) as Array<Partial<ConversationHistoryEntry>>;
+      const parsed = JSON.parse(raw) as Array<
+        Partial<ConversationHistoryEntry>
+      >;
       if (!Array.isArray(parsed)) {
         conversationHistory.value = [];
         return;
@@ -431,7 +647,7 @@ export const useLiveTranslation = () => {
     if (conversationHistory.value.length > HISTORY_LIMIT) {
       conversationHistory.value.splice(
         0,
-        conversationHistory.value.length - HISTORY_LIMIT
+        conversationHistory.value.length - HISTORY_LIMIT,
       );
     }
   };
@@ -459,7 +675,7 @@ export const useLiveTranslation = () => {
       "microphone",
       `Participant ${channels.value.length + 1}`,
       channels.value.length === 0 ? "en" : "auto",
-      defaultTarget ? [defaultTarget.code] : ["es"]
+      defaultTarget ? [defaultTarget.code] : ["es"],
     );
     const preferredDeviceId = microphoneManager.pickUnusedDeviceId();
     if (preferredDeviceId) {
@@ -473,13 +689,19 @@ export const useLiveTranslation = () => {
     if (hasSystemChannel.value) {
       setGlobalStatus(
         "Only one system audio capture is supported at a time.",
-        "info"
+        "info",
       );
       return;
     }
 
     addChannel(
-      createChannel("system", "Shared System Audio", "auto", ["en", "es"], false)
+      createChannel(
+        "system",
+        "Shared System Audio",
+        "auto",
+        ["en", "es"],
+        false,
+      ),
     );
   };
 
@@ -490,15 +712,23 @@ export const useLiveTranslation = () => {
     if (channel.isActive) {
       await pauseChannel(channel);
     }
-    await transcriptionManager.dispose(id);
+    await Promise.all([
+      chunkedTranscriptionManager.dispose(id),
+      streamingTranscriptionManager.dispose(id),
+    ]);
+    activeTranscriptionModes.delete(id);
     channels.value = channels.value.filter((item) => item.id !== id);
     ensureSelectedChannel();
   };
 
   const handleFinalTranscript = async (
     channel: ConversationChannel,
-    payload: FinalTranscriptPayload
+    payload: FinalTranscriptPayload,
   ): Promise<void> => {
+    if (!payload.isFinal) {
+      return;
+    }
+
     const previousFull = channel.lastFinalTranscript?.trim() ?? "";
     const fullUtterance = (payload.fullText ?? "").trim();
     const deltaUtterance = payload.deltaText.trim();
@@ -524,18 +754,16 @@ export const useLiveTranslation = () => {
         channel.targetLanguages.map(async (target) => {
           const result = await translateText(
             translationSource,
-            channel.sourceLanguage === "auto"
-              ? "auto"
-              : channel.sourceLanguage,
-            target
+            channel.sourceLanguage === "auto" ? "auto" : channel.sourceLanguage,
+            target,
           );
           const primary = result.translatedText.trim();
           const alternatives = Array.from(
             new Set(
               result.alternatives
                 .map((entry) => entry.trim())
-                .filter((entry) => entry.length > 0 && entry !== primary)
-            )
+                .filter((entry) => entry.length > 0 && entry !== primary),
+            ),
           );
           return {
             target,
@@ -543,7 +771,7 @@ export const useLiveTranslation = () => {
             alternatives,
             detectedLanguage: result.detectedLanguage,
           };
-        })
+        }),
       );
 
       const translationMap: Record<string, TranslationEntry> = {};
@@ -559,7 +787,7 @@ export const useLiveTranslation = () => {
         ...translationMap,
       };
       const detected = translationResults.find(
-        (entry) => entry.detectedLanguage
+        (entry) => entry.detectedLanguage,
       )?.detectedLanguage;
       channel.detectedLanguage = detected ?? channel.detectedLanguage;
       setChannelStatus(channel, "Translations updated", "success");
@@ -586,7 +814,7 @@ export const useLiveTranslation = () => {
       setChannelStatus(
         channel,
         "Failed to translate the latest speech segment.",
-        "error"
+        "error",
       );
     } finally {
       channel.isTranslating = false;
@@ -597,7 +825,7 @@ export const useLiveTranslation = () => {
     if (!speechSupported.value) {
       setGlobalStatus(
         "Audio capture is not supported in this browser.",
-        "error"
+        "error",
       );
       return;
     }
@@ -616,10 +844,9 @@ export const useLiveTranslation = () => {
           try {
             channel.systemStream = await startDesktopCapture();
           } catch (captureError) {
-            const message =
-              captureError instanceof Error
-                ? captureError.message
-                : "Desktop capture permission denied.";
+            const message = captureError instanceof Error
+              ? captureError.message
+              : "Desktop capture permission denied.";
             setChannelStatus(channel, message, "error");
             return;
           }
@@ -634,15 +861,19 @@ export const useLiveTranslation = () => {
         channel.sourceType === "microphone"
           ? "Connecting to microphone…"
           : "Preparing system capture…",
-        "processing"
+        "processing",
       );
 
-      await transcriptionManager.start(channel);
-      setChannelStatus(channel, "Listening…", "listening");
+      const mode = transcriptionMode.value;
+      activeTranscriptionModes.set(channel.id, mode);
+      const manager = transcriptionManagers[mode];
+
+      await manager.start(channel);
     } catch (error) {
       console.error("Failed to start channel", error);
       setChannelStatus(channel, "Unable to start listening.", "error");
       channel.isActive = false;
+      activeTranscriptionModes.delete(channel.id);
       microphoneManager.stopStream(channel);
       if (channel.sourceType === "system" && channel.systemStream) {
         resetDesktopCapture();
@@ -652,9 +883,13 @@ export const useLiveTranslation = () => {
   };
 
   const pauseChannel = async (
-    channel: ConversationChannel
+    channel: ConversationChannel,
   ): Promise<void> => {
-    await transcriptionManager.stop(channel.id);
+    const mode = activeTranscriptionModes.get(channel.id);
+    const manager = mode ? transcriptionManagers[mode] : chunkedTranscriptionManager;
+    activeTranscriptionModes.delete(channel.id);
+
+    await manager.stop(channel.id);
 
     channel.isActive = false;
 
@@ -687,7 +922,7 @@ export const useLiveTranslation = () => {
       }
       persistChannels();
     },
-    { deep: true }
+    { deep: true },
   );
 
   watch(selectedChannelId, () => {
@@ -702,16 +937,35 @@ export const useLiveTranslation = () => {
     () => {
       persistHistory();
     },
-    { deep: true }
+    { deep: true },
   );
 
   watch(showTranslationAlternatives, () => {
     persistAlternativePreference();
   });
 
+  watch(
+    transcriptionMode,
+    (newMode, oldMode) => {
+      if (!channelPersistenceReady) {
+        return;
+      }
+
+      persistTranscriptionMode();
+
+      if (newMode !== oldMode && isAnyChannelActive.value) {
+        setGlobalStatus(
+          "Transcription mode changes apply to newly started channels.",
+          "info",
+        );
+      }
+    },
+  );
+
   onMounted(async () => {
     restoreHistory();
     restoreAlternativePreference();
+    restoreTranscriptionMode();
 
     const restoredFromStorage = restoreChannels();
     restoreSelectedChannel();
@@ -737,7 +991,8 @@ export const useLiveTranslation = () => {
     channelPersistenceReady = true;
     persistChannels();
     persistSelectedChannel();
-  persistAlternativePreference();
+    persistAlternativePreference();
+    persistTranscriptionMode();
 
     if (typeof navigator !== "undefined" && navigator.mediaDevices) {
       const handler = () => {
@@ -762,7 +1017,9 @@ export const useLiveTranslation = () => {
   onUnmounted(() => {
     deviceChangeCleanup?.();
     deviceChangeCleanup = null;
-    void transcriptionManager.stopAll();
+    activeTranscriptionModes.clear();
+    void chunkedTranscriptionManager.stopAll();
+    void streamingTranscriptionManager.stopAll();
     channels.value.forEach((channel) => {
       microphoneManager.stopStream(channel);
       if (channel.systemStream) {
@@ -780,10 +1037,12 @@ export const useLiveTranslation = () => {
     conversationHistory,
     recentHistory,
     globalStatus,
-  showTranslationAlternatives,
+    showTranslationAlternatives,
+    transcriptionMode,
     speechSupported,
     desktopCaptureSupported,
     hasSystemChannel,
+    isAnyChannelActive,
     isSpeaking,
     audioInputOptions: microphoneManager.audioInputOptions,
     isRefreshingAudioInputs: microphoneManager.isRefreshing,
