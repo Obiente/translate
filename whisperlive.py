@@ -382,7 +382,7 @@ class WhisperLiveManager:
     def __init__(self) -> None:
         model_ref = os.getenv("WHISPERLIVE_MODEL", "turbo")
         cpu_threads = _env_int("WHISPERLIVE_CPU_THREADS", 0)
-        num_workers = max(_env_int("WHISPERLIVE_NUM_WORKERS", 2), 1)
+        num_workers = max(_env_int("WHISPERLIVE_NUM_WORKERS", 4), 1)
         device, compute_type = _detect_device()
 
         logger.info(
@@ -733,11 +733,11 @@ class WhisperLiveStreamSession:
         # Handle sentence-level final emission
         if sentence_final_text and not is_final:
             await self._emit_sentence_final(sentence_final_text, language)
-            # Trim buffer to prevent unlimited growth during long speech
-            await self._shrink_buffer_after_sentence_final()
+            # Trim buffer and reset context after sentence final
+            await self._reset_context_after_sentence_final()
             # Continue processing with remaining text for partial updates
             text = remaining_text
-            delta = _compute_delta(self.last_text, text)
+            delta = _compute_delta("", text)  # Reset delta since we finalized previous content
 
         if not is_final and not delta and not sentence_final_text:
             logger.debug(
@@ -794,7 +794,7 @@ class WhisperLiveStreamSession:
         self.last_text = text
 
         if is_final:
-            await self._finalize(final_requested=True)
+            await self._finalize_and_reset_context(final_requested=True)
         else:
             await self._shrink_buffer()
 
@@ -847,28 +847,50 @@ class WhisperLiveStreamSession:
             if self.buffer.size > self.context_samples:
                 self.buffer = self.buffer[-self.context_samples:]
 
-    async def _shrink_buffer_after_sentence_final(self) -> None:
-        """More aggressive buffer trimming after sentence finals to prevent unlimited growth."""
-        if self.context_samples <= 0:
-            return
+    async def _reset_context_after_sentence_final(self) -> None:
+        """Reset context after emitting a sentence-level final to prevent buffer growth."""
         async with self.lock:
-            # Keep less context after sentence finals - maybe 50% of normal context
-            reduced_context = max(self.context_samples // 2, self.min_samples * 2)
-            if self.buffer.size > reduced_context:
-                self.buffer = self.buffer[-reduced_context:]
+            # More aggressive buffer trimming - keep only recent context for next sentence
+            # This prevents unlimited growth during long continuous speech
+            keep_context = max(self.min_samples * 4, int(3.0 * DEFAULT_SAMPLE_RATE))  # Keep ~3 seconds
+            if self.buffer.size > keep_context:
+                self.buffer = self.buffer[-keep_context:]
                 logger.debug(
-                    "Buffer trimmed after sentence final",
+                    "Context reset after sentence final",
                     extra={
                         "channel_id": self.channel_id,
                         "new_buffer_size": self.buffer.size,
-                        "reduced_context_size": reduced_context,
+                        "keep_context_size": keep_context,
                     },
                 )
+            
+            # Reset text tracking for the finalized content
+            self.last_text = ""  # Reset since we finalized previous content
+            self.repeated_transcript_count = 0
+            self.last_repeated_transcript = ""
 
-    async def _finalize(self, final_requested: bool) -> None:
+    async def _finalize_and_reset_context(self, final_requested: bool) -> None:
+        """Finalize and reset context after a complete final emission."""
         async with self.lock:
             now_ts = time.monotonic()
-            self.buffer = np.empty(0, dtype=np.float32)
+            
+            # Keep a small amount of recent audio context for next utterance
+            # This helps with continuity while preventing unlimited growth
+            keep_recent = max(self.min_samples * 2, int(1.0 * DEFAULT_SAMPLE_RATE))  # Keep ~1 second
+            if self.buffer.size > keep_recent:
+                self.buffer = self.buffer[-keep_recent:]
+                logger.debug(
+                    "Context trimmed after full final",
+                    extra={
+                        "channel_id": self.channel_id,
+                        "new_buffer_size": self.buffer.size,
+                        "keep_recent_size": keep_recent,
+                    },
+                )
+            else:
+                # If buffer is small, clear it completely
+                self.buffer = np.empty(0, dtype=np.float32)
+            
             self.final_requested = False
             future = self.final_future
             self.final_future = None
