@@ -21,6 +21,56 @@
 
 .page-header h1 { margin-bottom: 0.5rem; color: var(--accent-2); }
 
+.page-header .header-cta {
+  display: flex;
+  align-items: center;
+}
+
+/* Branded topbar + hero */
+.page-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.25rem 0.25rem 0;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: #e6e6e6;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+
+.brand-mark {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: linear-gradient(135deg, #1db954, #1ed760);
+  box-shadow: 0 6px 18px rgba(29, 185, 84, 0.25);
+}
+
+.brand-name {
+  font-size: 0.95rem;
+}
+
+.page-hero {
+  padding: 1rem 0 0.5rem;
+}
+
+.button.focus-cta {
+  background: linear-gradient(135deg, #1db954, #1ed760);
+  color: #000;
+  border: none;
+  font-weight: 700;
+  border-radius: 999px;
+  padding: 0.85rem 1.25rem;
+  box-shadow: 0 6px 18px rgba(29, 185, 84, 0.3);
+}
+.button.focus-cta:hover { box-shadow: 0 10px 24px rgba(29, 185, 84, 0.4); transform: translateY(-1px); }
+
 .global-status {
   display: flex;
   justify-content: center;

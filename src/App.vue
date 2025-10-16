@@ -1,11 +1,29 @@
 <template>
   <div class="app" :class="{ 'app-focused': showFocusedView }">
     <header class="page-header" v-if="!showFocusedView">
-      <h1>Live Multi-Source Translator</h1>
-      <p>
-        Add participants, pick their input sources, and let the app translate
-        conversations in real time.
-      </p>
+      <div class="page-topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <span class="brand-name">Obiente Translate</span>
+        </div>
+        <div class="header-cta">
+          <button
+            class="button focus-cta"
+            type="button"
+            @click="showFocusedView = true"
+            title="Enter Focus Mode"
+          >
+            🎯 Enter Focus Mode
+          </button>
+        </div>
+      </div>
+      <div class="page-hero">
+        <h1>Live Multi-Source Translator</h1>
+        <p>
+          Add participants, pick their input sources, and let the app
+          translate conversations in real time.
+        </p>
+      </div>
     </header>
 
     <section class="global-status" v-if="globalStatus && !showFocusedView">
@@ -466,18 +484,69 @@
       </div>
       <p v-else class="placeholder">No recorded history yet.</p>
     </section>
+
+    <footer class="site-footer" v-if="!showFocusedView">
+      <div>
+        <span>Obiente Translate</span>
+        <span class="dot">•</span>
+        <span>by Obiente, LLC · Hosted on Obiente Cloud</span>
+      </div>
+      <div>
+        <a href="/about">About</a>
+        <span class="dot">•</span>
+        <a href="/privacy">Privacy</a>
+        <span class="dot">•</span>
+        <a href="/terms">Terms</a>
+        <span class="dot">•</span>
+        <a
+          href="https://github.com/Obiente/translate"
+          target="_blank"
+          rel="noopener"
+          >GitHub</a
+        >
+        <span class="dot">•</span>
+        <a href="https://github.com/Obiente" target="_blank" rel="noopener"
+          >@Obiente</a
+        >
+        <span class="dot">•</span>
+        <a href="https://obiente.org" target="_blank" rel="noopener"
+          >obiente.org</a
+        >
+        <span class="dot">•</span>
+        <a href="https://obiente.com" target="_blank" rel="noopener"
+          >obiente.com</a
+        >
+      </div>
+    </footer>
   </div>
 </template>
 
 <script setup lang="ts">
-  import { ref } from "vue";
+  import { ref, onMounted, watch } from "vue";
   import { useLiveTranslation } from "./composables/useLiveTranslation";
   import FocusedView from "./components/FocusedView.vue";
   import ConversationFeed from "./components/ConversationFeed.vue";
   import "./app.css";
+  import { FOCUSED_VIEW_STATE_KEY } from "./constants/storage";
 
   // Local reactive state
-  const showFocusedView = ref(true);
+  // Default to settings (non-focused) on first load; then restore last state if available
+  const showFocusedView = ref(false);
+
+  onMounted(() => {
+    try {
+      const saved = localStorage.getItem(FOCUSED_VIEW_STATE_KEY);
+      if (saved === "true" || saved === "false") {
+        showFocusedView.value = saved === "true";
+      }
+    } catch {}
+  });
+
+  watch(showFocusedView, (val) => {
+    try {
+      localStorage.setItem(FOCUSED_VIEW_STATE_KEY, String(val));
+    } catch {}
+  });
 
   const {
     languages,
@@ -625,3 +694,29 @@
     resolveMicrophoneLabel,
   });
 </script>
+
+<style scoped>
+  .site-footer {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    color: rgba(255, 255, 255, 0.6);
+    font-size: 0.85rem;
+    margin-top: 2rem;
+  }
+  .site-footer .dot {
+    margin: 0 1rem;
+    opacity: 0.6;
+  }
+  .site-footer a {
+    color: #1db954;
+    text-decoration: none;
+    opacity: 0.9;
+  }
+  .site-footer a:hover {
+    text-decoration: underline;
+    opacity: 1;
+  }
+</style>

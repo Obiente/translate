@@ -1,24 +1,33 @@
 <template>
   <div class="spotify-lyrics-display" ref="containerRef">
     <!-- Original text overlay (fixed, not inside scroll) shows current sentence's original -->
-    <div v-if="currentOriginalText" class="original-overlay" aria-live="polite" :style="overlayTopStyle">
+    <div
+      v-if="currentOriginalText"
+      class="original-overlay"
+      aria-live="polite"
+      :style="overlayTopStyle"
+    >
       <div class="original-text">
         <span class="original-label">Original:</span>
         {{ currentOriginalText }}
       </div>
     </div>
-    
+
     <!-- Speaker indicator if provided (component-level speaker; hidden when using per-sentence speakers) -->
-    <div v-if="props.speaker && !hasPerSentenceSpeakers" class="speaker-indicator">
-      <div 
-        class="speaker-avatar" 
+    <div
+      v-if="props.speaker && !hasPerSentenceSpeakers"
+      class="speaker-indicator"
+    >
+      <div
+        v-if="showInitials"
+        class="speaker-avatar"
         :style="{ backgroundColor: getSpeakerColor(props.speaker) }"
       >
         {{ getSpeakerInitials(props.speaker) }}
       </div>
       <span class="speaker-name">{{ props.speaker }}</span>
     </div>
-    
+
     <!-- All sentences with typing animation -->
     <div
       v-for="(sentence, idx) in allSentences"
@@ -36,10 +45,15 @@
       ]"
     >
       <!-- Speaker inline avatar (prefer sentence-level speaker; fallback to component-level) -->
-      <div v-if="sentence.speaker || props.speaker" class="speaker-inline">
+      <div
+        v-if="showInitials && (sentence.speaker || props.speaker) && sentence.displayed"
+        class="speaker-inline"
+      >
         <div
           class="speaker-avatar inline"
-          :style="{ backgroundColor: getSpeakerColor(sentence.speaker || props.speaker) }"
+          :style="{
+            backgroundColor: getSpeakerColor(sentence.speaker || props.speaker),
+          }"
         >
           {{ getSpeakerInitials(sentence.speaker || props.speaker) }}
         </div>
@@ -132,9 +146,31 @@
   const hasPerSentenceSpeakers = computed(() =>
     allSentences.value.some((s) => !!s.speaker)
   );
+
+  // Only show initials if there is more than one unique speaker in the recent window
+  // Focus on visible/active context: last few sentences that have some displayed text
+  const showInitials = computed(() => {
+    let recent = allSentences.value.filter((s) => (s.displayed?.length ?? 0) > 0);
+    if (recent.length === 0 && allSentences.value.length > 0) {
+      // Nothing displayed yet: consider the latest sentence (current line)
+      recent = [allSentences.value[allSentences.value.length - 1]];
+    }
+    recent = recent.slice(-8);
+    const names = new Set<string>();
+    for (const s of recent) {
+      const n = (s.speaker || props.speaker || "").trim();
+      if (n) names.add(n);
+      if (names.size > 1) return true;
+    }
+    return names.size > 1;
+  });
   const overlayTopStyle = computed(() => {
-    if (props.overlayTop === undefined || props.overlayTop === null) return {} as Record<string, string>;
-    const val = typeof props.overlayTop === 'number' ? `${props.overlayTop}px` : String(props.overlayTop);
+    if (props.overlayTop === undefined || props.overlayTop === null)
+      return {} as Record<string, string>;
+    const val =
+      typeof props.overlayTop === "number"
+        ? `${props.overlayTop}px`
+        : String(props.overlayTop);
     return { top: val } as Record<string, string>;
   });
 
@@ -206,18 +242,38 @@
   const isStreaming = computed(() => props.streaming && !props.isFinal);
 
   // Process text and update sentences with typing animation
-  const buildSentenceUnits = (): Array<{ id: string; text: string; speaker?: string; original?: string }> => {
-    const units: Array<{ id: string; text: string; speaker?: string; original?: string }> = [];
+  const buildSentenceUnits = (): Array<{
+    id: string;
+    text: string;
+    speaker?: string;
+    original?: string;
+  }> => {
+    const units: Array<{
+      id: string;
+      text: string;
+      speaker?: string;
+      original?: string;
+    }> = [];
     const segs = Array.isArray(props.segments) ? props.segments : [];
     if (segs.length > 0) {
       segs.forEach((seg, segIndex) => {
         const baseId = seg.id || `seg-${segIndex}`;
         const parts = splitIntoSentences(seg.text || "");
         if (parts.length === 0 && (seg.text || "").trim().length) {
-          units.push({ id: `${baseId}-0`, text: seg.text, speaker: seg.speaker, original: seg.originalText });
+          units.push({
+            id: `${baseId}-0`,
+            text: seg.text,
+            speaker: seg.speaker,
+            original: seg.originalText,
+          });
         } else {
           parts.forEach((p, i) => {
-            units.push({ id: `${baseId}-${i}`, text: p, speaker: seg.speaker, original: seg.originalText });
+            units.push({
+              id: `${baseId}-${i}`,
+              text: p,
+              speaker: seg.speaker,
+              original: seg.originalText,
+            });
           });
         }
       });
@@ -226,9 +282,21 @@
       if (!text) return units;
       const parts = splitIntoSentences(text);
       if (parts.length === 0) {
-        units.push({ id: `single-0`, text, speaker: props.speaker, original: props.originalText });
+        units.push({
+          id: `single-0`,
+          text,
+          speaker: props.speaker,
+          original: props.originalText,
+        });
       } else {
-        parts.forEach((p, i) => units.push({ id: `single-${i}`, text: p, speaker: props.speaker, original: props.originalText }));
+        parts.forEach((p, i) =>
+          units.push({
+            id: `single-${i}`,
+            text: p,
+            speaker: props.speaker,
+            original: props.originalText,
+          })
+        );
       }
     }
     return units;
@@ -286,7 +354,8 @@
     if (!hasInitialized.value) {
       hasInitialized.value = true;
       for (let i = 0; i < newModels.length; i++) {
-        newModels[i].displayed = i < newModels.length - 1 ? newModels[i].full : "";
+        newModels[i].displayed =
+          i < newModels.length - 1 ? newModels[i].full : "";
         newModels[i].isAnimating = i === newModels.length - 1;
       }
     }
@@ -623,7 +692,10 @@
       line-height: 1.4;
     }
 
-    .original-overlay { top: clamp(8px, 5vh, 56px); padding: 0 0.75rem; }
+    .original-overlay {
+      top: clamp(8px, 5vh, 56px);
+      padding: 0 0.75rem;
+    }
 
     .original-text {
       font-size: clamp(0.7rem, 2.5vw, 0.85rem);

@@ -2,45 +2,45 @@
   <div class="focused-view" :class="{ 'full-screen': isFullScreen }">
     <!-- Header with controls - Hidden in full screen -->
     <header class="focused-header" v-if="!isFullScreen">
-      <div class="focused-controls">
-        <div class="channel-quick-controls">
-          <div class="speaking-badges" v-if="activeChannelsWithContent.length">
-            <ParticipantChip
-              v-for="channel in activeChannelsWithContent"
-              :key="`badge-${channel.id}`"
-              :label="channel.label"
-            />
-          </div>
-          <button
+      <h1 class="focused-title">Obiente Translate</h1>
+      <div class="channel-bar">
+        <div class="speaking-badges" v-if="activeChannelsWithContent.length">
+          <ParticipantChip
+            v-for="channel in activeChannelsWithContent"
+            :key="`badge-${channel.id}`"
+            :label="channel.label"
+          />
+        </div>
+        <div class="channel-chips">
+          <ParticipantChip
             v-for="channel in props.channels"
             :key="channel.id"
-            class="button channel-toggle"
-            :class="{ active: channel.isActive }"
-            @click="props.toggleChannel(channel.id)"
-            type="button"
+            :label="channel.label"
             :title="`${channel.isActive ? 'Pause' : 'Start'} ${channel.label}`"
-          >
-            {{ channel.isActive ? "⏸️" : "▶️" }} {{ channel.label }}
-          </button>
+            :icon="channel.isActive ? '⏸' : '▶️'"
+            :isActive="channel.isActive"
+            :interactive="true"
+            @click="props.toggleChannel(channel.id)"
+          />
         </div>
-        <div class="header-actions">
-          <button
-            class="button"
-            @click="toggleFullScreen"
-            type="button"
-            title="Enter Full Screen"
-          >
-            ⛶ Full Screen
-          </button>
+      </div>
+      <div class="header-actions">
+        <button
+          class="button"
+          @click="toggleFullScreen"
+          type="button"
+          title="Enter Full Screen"
+        >
+          ⛶ Full Screen
+        </button>
 
-          <button
-            class="button active"
-            @click="$emit('toggleFocus')"
-            type="button"
-          >
-            📋 Exit Focus
-          </button>
-        </div>
+        <button
+          class="button active"
+          @click="$emit('toggleFocus')"
+          type="button"
+        >
+          📋 Exit Focus
+        </button>
       </div>
     </header>
 
@@ -56,11 +56,19 @@
       </button>
     </div>
 
+    <!-- Subtle watermark in fullscreen -->
+    <div class="brand-watermark" v-if="isFullScreen">
+      Obiente Translate • Obiente Cloud
+    </div>
+
     <!-- Content Area - Bottom Origin Layout -->
     <div class="focused-content">
       <!-- When not in full-screen, keep separate sections for history and live -->
       <template v-if="!isFullScreen">
-        <div class="embedded-lyrics" v-if="unifiedFeed && unifiedFeed.segments.length">
+        <div
+          class="embedded-lyrics"
+          v-if="unifiedFeed && unifiedFeed.segments.length"
+        >
           <LyricsDisplay
             :segments="unifiedFeed.segments"
             :streaming="unifiedFeed.streaming"
@@ -81,7 +89,10 @@
             :label="p.label"
           />
         </div>
-        <div class="full-screen-feed" v-if="unifiedFeed && unifiedFeed.segments.length">
+        <div
+          class="full-screen-feed"
+          v-if="unifiedFeed && unifiedFeed.segments.length"
+        >
           <LyricsDisplay
             :segments="unifiedFeed.segments"
             :streaming="unifiedFeed.streaming"
@@ -164,14 +175,14 @@
     scheduleInactivity();
   };
   onMounted(() => {
-    ["mousemove", "mousedown", "keydown", "touchstart", "pointermove"].forEach((ev) =>
-      window.addEventListener(ev, onUserActivity, { passive: true })
+    ["mousemove", "mousedown", "keydown", "touchstart", "pointermove"].forEach(
+      (ev) => window.addEventListener(ev, onUserActivity, { passive: true })
     );
     scheduleInactivity();
   });
   onUnmounted(() => {
-    ["mousemove", "mousedown", "keydown", "touchstart", "pointermove"].forEach((ev) =>
-      window.removeEventListener(ev, onUserActivity as any)
+    ["mousemove", "mousedown", "keydown", "touchstart", "pointermove"].forEach(
+      (ev) => window.removeEventListener(ev, onUserActivity as any)
     );
     if (inactivityTimer !== null) {
       clearTimeout(inactivityTimer);
@@ -264,23 +275,35 @@
     return best;
   };
 
-  type Segment = { id?: string; text: string; originalText?: string; speaker?: string; timestamp?: number | string };
+  type Segment = {
+    id?: string;
+    text: string;
+    originalText?: string;
+    speaker?: string;
+    timestamp?: number | string;
+  };
   const unifiedFeed = computed(() => {
     const displayCode = chooseDisplayLanguage();
     const segs: Segment[] = [];
 
     // History first (already finalized), sorted by timestamp ascending
-    const history = [...recentHistoryWithTranslations.value].sort((a, b) =>
-      new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+    const history = [...recentHistoryWithTranslations.value].sort(
+      (a, b) =>
+        new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
     );
     for (const entry of history) {
       let t: Translation | undefined = undefined;
       if (displayCode) {
         t = entry.translations?.[displayCode];
       }
-      const text = (t?.primary || (t?.alternatives?.[0] ?? "") || entry.transcript || "").trim();
+      const text = (
+        t?.primary ||
+        (t?.alternatives?.[0] ?? "") ||
+        entry.transcript ||
+        ""
+      ).trim();
       if (!text) continue;
-      const originalText = t ? (entry.transcript || "") : undefined;
+      const originalText = t ? entry.transcript || "" : undefined;
       segs.push({
         id: `h-${entry.id}`,
         text,
@@ -303,12 +326,22 @@
         : "";
       const text = (live || ch.liveTranscript || "").trim();
       if (!text) continue;
-      const originalText = live ? (ch.liveTranscript || "") : undefined;
-      segs.push({ id: `l-${ch.id}`, text, originalText, speaker: ch.label, timestamp: Date.now() });
+      const originalText = live ? ch.liveTranscript || "" : undefined;
+      segs.push({
+        id: `l-${ch.id}`,
+        text,
+        originalText,
+        speaker: ch.label,
+        timestamp: Date.now(),
+      });
     }
 
     // Sort again by timestamp as live segments use now()
-    segs.sort((a, b) => (new Date(a.timestamp || 0).getTime() - new Date(b.timestamp || 0).getTime()));
+    segs.sort(
+      (a, b) =>
+        new Date(a.timestamp || 0).getTime() -
+        new Date(b.timestamp || 0).getTime()
+    );
 
     const anyActive = props.channels.some((c) => c.isActive && !c.isFinal);
     return {

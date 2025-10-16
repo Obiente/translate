@@ -7,3 +7,6 @@ export const TRANSLATION_ALTERNATIVE_LIMIT_KEY =
     "live-translation-alternative-limit";
 export const TRANSCRIPTION_MODE_KEY = "live-transcription-mode";
 export const HISTORY_LIMIT = 40;
+
+// UI state
+export const FOCUSED_VIEW_STATE_KEY = "live-focused-view-state"; // "true" | "false"

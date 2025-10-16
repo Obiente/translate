@@ -106,33 +106,42 @@
   -webkit-backdrop-filter: blur(25px);
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
   padding: clamp(0.5rem, 2vw, 0.75rem) clamp(1rem, 4vw, 2rem);
-  display: flex;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 1rem;
   align-items: center;
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
   contain: layout style paint;
 }
 
 .focused-title {
-  font-size: 1.2rem;
-  font-weight: 700;
+  font-size: 1.1rem;
+  font-weight: 800;
   color: #fff;
   margin: 0;
   letter-spacing: -0.02em;
+  opacity: 0.9;
 }
 
-.focused-controls {
+.channel-bar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: clamp(0.5rem, 3vw, 2rem);
-  flex: 1;
+  justify-content: flex-start;
+  gap: 0.75rem 1rem;
+  flex-wrap: wrap;
 }
 
 .channel-quick-controls {
   display: flex;
   align-items: center;
   gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.channel-chips {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
   flex-wrap: wrap;
 }
 
@@ -164,6 +173,22 @@
   color: #000;
   font-weight: 600;
   border: none;
+}
+
+/* Fullscreen brand watermark */
+.brand-watermark {
+  position: fixed;
+  bottom: clamp(10px, 3vh, 24px);
+  right: clamp(12px, 4vw, 24px);
+  z-index: 1200;
+  font-size: 0.8rem;
+  color: rgba(255, 255, 255, 0.5);
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 0.35rem 0.6rem;
+  border-radius: 8px;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
 }
 
 /* Content Areas */

@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="About Obiente Translate — real-time, multi-speaker transcription and translation with a Spotify-style lyrics view." />
+  <title>About • Obiente Translate</title>
+  <meta name="theme-color" content="#0f0f0f" />
+  <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+  <link rel="canonical" href="/about" />
+  <meta name="robots" content="index,follow" />
+  <!-- Open Graph / Twitter -->
+  <meta property="og:type" content="article" />
+  <meta property="og:title" content="About • Obiente Translate" />
+  <meta property="og:description" content="Learn about Obiente Translate, a real-time, multi-speaker transcription and translation app with a Spotify-style lyrics view." />
+  <meta property="og:url" content="/about" />
+  <meta name="twitter:card" content="summary" />
+  <meta name="twitter:title" content="About • Obiente Translate" />
+  <meta name="twitter:description" content="Learn about Obiente Translate, a real-time, multi-speaker transcription and translation app." />
+  <!-- JSON-LD: WebPage + BreadcrumbList -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebPage",
+    "name": "About • Obiente Translate",
+    "url": "/about",
+    "publisher": { "@type": "Organization", "name": "Obiente, LLC", "url": "/" }
+  }
+  </script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    "itemListElement": [
+      {"@type": "ListItem", "position": 1, "name": "Home", "item": "/"},
+      {"@type": "ListItem", "position": 2, "name": "About", "item": "/about"}
+    ]
+  }
+  </script>
+  <style>
+    body { margin: 0; font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif; background:#0f0f0f; color:#e8e8e8; }
+    .wrap { max-width: 900px; margin: 0 auto; padding: 2rem 1rem; }
+    a { color: #1db954; text-decoration: none; }
+  header, footer { opacity: .8; }
+    h1 { font-weight: 800; letter-spacing:-.02em; }
+  p { line-height: 1.6; color:#cfcfcf; }
+  .features { display:grid; gap: .75rem; padding-left: 1.2rem; }
+  .cta { margin-top: 1.5rem; }
+  .button { border: none; border-radius: 999px; padding: .85rem 1.25rem; font-weight: 700; }
+  .button.primary { background: linear-gradient(135deg,#1db954,#1ed760); color:#000; box-shadow: 0 6px 18px rgba(29,185,84,.3); }
+  .links { margin-top: 1rem; display: flex; gap: .75rem; flex-wrap: wrap; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <a href="/">← Back</a>
+    </header>
+    <main>
+      <h1>About Obiente Translate</h1>
+      <p>
+        Obiente Translate turns live conversations into a unified, readable stream with original + translated text.
+        It’s optimized for events, meetings, and collaboration, with a Spotify-style lyrics view that’s easy to follow.
+      </p>
+      <ul class="features">
+        <li>Multi-speaker interleaved feed with speaker labels and color-coded avatars</li>
+        <li>Sentence-level typing animation; current line centered and auto-scrolling</li>
+        <li>Fullscreen kiosk mode with participants bar and inactivity auto-fullscreen</li>
+        <li>Original text overlay and per-sentence metadata</li>
+        <li>Microphone and system audio inputs; robust multi-source handling</li>
+      </ul>
+      <div class="cta">
+        <a href="/" class="button primary">Try it out</a>
+      </div>
+      <div class="links">
+        <a href="https://github.com/Obiente/translate" target="_blank" rel="noopener">GitHub: Obiente/translate</a>
+        <a href="https://github.com/Obiente" target="_blank" rel="noopener">GitHub: @Obiente</a>
+        <a href="https://obiente.org" target="_blank" rel="noopener">obiente.org</a>
+        <a href="https://obiente.com" target="_blank" rel="noopener">obiente.com</a>
+      </div>
+    </main>
+    <footer>
+      <p>© <span id="y"></span> Obiente, LLC. Hosted on Obiente Cloud.</p>
+    </footer>
+  </div>
+  <script>document.getElementById('y').textContent = new Date().getFullYear();</script>
+</body>
+</html>
