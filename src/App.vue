@@ -688,7 +688,7 @@ defineExpose({
   .detail-controls {
     display: grid;
     gap: 1rem;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
     align-items: end;
   }
 
