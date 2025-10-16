@@ -6,8 +6,8 @@ import {
   HISTORY_STORAGE_KEY,
   SELECTED_CHANNEL_KEY,
   SHOW_TRANSLATION_ALTERNATIVES_KEY,
-  TRANSLATION_ALTERNATIVE_LIMIT_KEY,
   TRANSCRIPTION_MODE_KEY,
+  TRANSLATION_ALTERNATIVE_LIMIT_KEY,
 } from "../constants/storage";
 import { useAudioCapture } from "../composables/useAudioCapture";
 import { useSpeechSynthesis } from "../composables/useSpeechSynthesis";
@@ -57,7 +57,7 @@ const createChannel = (
   label: string,
   sourceLanguage: string,
   targetLanguages: string[],
-  autoSpeak = true,
+  autoSpeak = false,
   id?: string,
   microphoneDeviceId?: string | null,
   microphoneDeviceLabel?: string | null,
@@ -76,6 +76,7 @@ const createChannel = (
   isTranslating: false,
   status: null,
   autoSpeak,
+  isFinal: false,
   microphoneDeviceId: microphoneDeviceId ?? null,
   microphoneDeviceLabel: microphoneDeviceLabel ?? null,
   microphoneStream: null,
@@ -93,7 +94,9 @@ export const useLiveTranslation = () => {
   const translationAlternativesLimit = ref<number>(clampAlternativeLimit(2));
   const resolveAlternativeLimit = (): number =>
     clampAlternativeLimit(
-      showTranslationAlternatives.value ? translationAlternativesLimit.value : 0,
+      showTranslationAlternatives.value
+        ? translationAlternativesLimit.value
+        : 0,
     );
   const transcriptionMode = ref<TranscriptionMode>("streaming");
   const speechSupported = ref<boolean>(
@@ -103,7 +106,10 @@ export const useLiveTranslation = () => {
   );
 
   const LIVE_TRANSLATION_DEBOUNCE_MS = 450;
-  const liveTranslationTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const liveTranslationTimers = new Map<
+    string,
+    ReturnType<typeof setTimeout>
+  >();
   const liveTranslationRequests = new Map<string, symbol>();
 
   const sanitizeTranslationEntry = (
@@ -113,16 +119,12 @@ export const useLiveTranslation = () => {
       return null;
     }
 
-    let primary = typeof entry.primary === "string"
-      ? entry.primary.trim()
-      : "";
+    let primary = typeof entry.primary === "string" ? entry.primary.trim() : "";
     let alternatives = Array.isArray(entry.alternatives)
       ? Array.from(
         new Set(
           entry.alternatives
-            .map((option) =>
-              typeof option === "string" ? option.trim() : "",
-            )
+            .map((option) => typeof option === "string" ? option.trim() : "")
             .filter((option) => option.length > 0),
         ),
       )
@@ -151,11 +153,15 @@ export const useLiveTranslation = () => {
     }
 
     const whitelist = new Set(
-      targetLanguages.map((code) => code.trim()).filter((code) => code.length > 0),
+      targetLanguages.map((code) => code.trim()).filter((code) =>
+        code.length > 0
+      ),
     );
     const allowAll = whitelist.size === 0;
 
-    return Object.entries(translations).reduce<Record<string, TranslationEntry>>(
+    return Object.entries(translations).reduce<
+      Record<string, TranslationEntry>
+    >(
       (acc, [code, entry]) => {
         if (!allowAll && !whitelist.has(code)) {
           return acc;
@@ -282,6 +288,9 @@ export const useLiveTranslation = () => {
       if (language) {
         channel.detectedLanguage = language;
       }
+      // Update the channel's isFinal status
+      channel.isFinal = isFinal;
+
       if (fullText && fullText.length > 0) {
         channel.liveTranscript = fullText;
       } else if (text.length > 0) {
@@ -334,6 +343,147 @@ export const useLiveTranslation = () => {
     chunked: chunkedTranscriptionManager,
     streaming: streamingTranscriptionManager,
   };
+
+  // Final-history push scheduling (avoid pushing a history entry before the transcript has fully stabilized)
+  const FINAL_HISTORY_PUSH_DELAY_MS = 450; // wait for a short window to allow any trailing deltas
+  const FINAL_HISTORY_MAX_RETRIES = 6; // allow a few reschedules (~2.7s max)
+  const finalHistoryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const finalHistoryAttempts = new Map<string, number>();
+
+  async function finalizeHistoryEntry(
+    channel: ConversationChannel,
+    assembledFinal: string,
+    providedTranslations: Record<string, TranslationEntry> | null,
+    providedDetectedLanguage: string | null,
+  ) {
+    // Ensure the final value we will persist is the most recent assembled form
+    const finalText = (channel.lastFinalTranscript || assembledFinal || "")
+      .trim();
+
+    // If translations were provided by the server, use those; otherwise compute them now
+    let translationMap: Record<string, TranslationEntry> = {};
+    let detectedFromTranslations: string | null = null;
+
+    if (providedTranslations && Object.keys(providedTranslations).length > 0) {
+      translationMap = providedTranslations;
+    } else if (channel.targetLanguages.length > 0) {
+      // Compute translations just-in-time to ensure they match the final text
+      try {
+        const altLimit = resolveAlternativeLimit();
+        const translationResults = await Promise.all(
+          channel.targetLanguages.map(async (target) => {
+            const result = await translateText(
+              finalText,
+              channel.sourceLanguage === "auto"
+                ? "auto"
+                : channel.sourceLanguage,
+              target,
+              altLimit,
+            );
+            return {
+              target,
+              entry: sanitizeTranslationEntry({
+                primary: result.translatedText,
+                alternatives: Array.isArray(result.alternatives)
+                  ? result.alternatives
+                  : [],
+              }),
+              detectedLanguage: result.detectedLanguage,
+            };
+          }),
+        );
+
+        translationResults.forEach((entry) => {
+          if (entry.entry) translationMap[entry.target] = entry.entry;
+          if (!detectedFromTranslations && entry.detectedLanguage) {
+            detectedFromTranslations = entry.detectedLanguage;
+          }
+        });
+      } catch (error) {
+        console.warn("Translation at history-finalize failed", error);
+      }
+    }
+
+    // Save translations to the channel state for UI (merge)
+    if (Object.keys(translationMap).length > 0) {
+      channel.translations = {
+        ...channel.translations,
+        ...translationMap,
+      };
+      channel.detectedLanguage = providedDetectedLanguage ??
+        detectedFromTranslations ?? channel.detectedLanguage;
+    }
+
+    // Push the history entry
+    conversationHistoryPush({
+      id: createId(),
+      channelId: channel.id,
+      channelLabel: channel.label,
+      sourceLanguage: channel.sourceLanguage,
+      detectedLanguage: channel.detectedLanguage ?? null,
+      transcript: finalText,
+      translations: translationMap,
+      timestamp: new Date().toISOString(),
+    });
+
+    // Cleanup: clear live transcript and translating state
+    channel.liveTranscript = "";
+    channel.isTranslating = false;
+  }
+
+  function scheduleFinalHistoryPush(
+    channel: ConversationChannel,
+    assembledFinal: string,
+    providedTranslations: Record<string, TranslationEntry> | null = null,
+    providedDetectedLanguage: string | null = null,
+  ) {
+    const id = channel.id;
+
+    // Clear any existing timer
+    const existing = finalHistoryTimers.get(id);
+    if (existing) {
+      clearTimeout(existing);
+      finalHistoryTimers.delete(id);
+    }
+
+    const attempts = finalHistoryAttempts.get(id) ?? 0;
+    if (attempts > FINAL_HISTORY_MAX_RETRIES) {
+      // Give up waiting and finalize immediately to avoid losing the entry
+      void finalizeHistoryEntry(
+        channel,
+        assembledFinal,
+        providedTranslations,
+        providedDetectedLanguage,
+      );
+      finalHistoryAttempts.delete(id);
+      return;
+    }
+
+    const timer = setTimeout(async () => {
+      finalHistoryTimers.delete(id);
+
+      const latestAssembled =
+        (channel.lastFinalTranscript || channel.liveTranscript || "").trim();
+
+      if (latestAssembled && latestAssembled !== assembledFinal) {
+        // Transcript changed during the wait — reschedule with the latest assembled value and drop any provided translations
+        finalHistoryAttempts.set(id, (finalHistoryAttempts.get(id) ?? 0) + 1);
+        scheduleFinalHistoryPush(channel, latestAssembled, null, null);
+        return;
+      }
+
+      // Either stable or nothing new; finalize now
+      await finalizeHistoryEntry(
+        channel,
+        latestAssembled || assembledFinal,
+        providedTranslations,
+        providedDetectedLanguage,
+      );
+      finalHistoryAttempts.delete(id);
+    }, FINAL_HISTORY_PUSH_DELAY_MS);
+
+    finalHistoryTimers.set(id, timer);
+  }
 
   const activeTranscriptionModes = new Map<string, TranscriptionMode>();
 
@@ -720,7 +870,7 @@ export const useLiveTranslation = () => {
             item.label || "Participant",
             item.sourceLanguage || "auto",
             targetLanguages,
-            item.autoSpeak ?? true,
+            item.autoSpeak ?? false,
             item.id,
             item.microphoneDeviceId ?? null,
             item.microphoneDeviceLabel ?? null,
@@ -872,6 +1022,13 @@ export const useLiveTranslation = () => {
     activeTranscriptionModes.delete(id);
     channels.value = channels.value.filter((item) => item.id !== id);
     ensureSelectedChannel();
+    // Clear any scheduled final-history push for this channel
+    const timer = finalHistoryTimers.get(id);
+    if (timer) {
+      clearTimeout(timer);
+      finalHistoryTimers.delete(id);
+    }
+    finalHistoryAttempts.delete(id);
   };
 
   const handleFinalTranscript = async (
@@ -885,18 +1042,24 @@ export const useLiveTranslation = () => {
     const previousFull = channel.lastFinalTranscript?.trim() ?? "";
     const fullUtterance = (payload.fullText ?? "").trim();
     const deltaUtterance = payload.deltaText.trim();
-    const effectiveUtterance = fullUtterance || deltaUtterance;
 
-    if (!effectiveUtterance) {
+    // Assemble the best possible final transcript: prefer explicit fullText from the server,
+    // otherwise use the accumulated channel.liveTranscript (which should contain the
+    // concatenated deltas), and lastly fall back to the delta included in this final payload.
+    const assembledFinal = fullUtterance || channel.liveTranscript?.trim() ||
+      deltaUtterance;
+
+    if (!assembledFinal) {
       return;
     }
 
-    if (fullUtterance && fullUtterance === previousFull) {
+    // Deduplicate identical final transcripts (use assembled form for reliability)
+    if (assembledFinal === previousFull) {
       return;
     }
 
     ensureTargets(channel);
-    channel.lastFinalTranscript = fullUtterance || effectiveUtterance;
+    channel.lastFinalTranscript = assembledFinal;
 
     const filteredServerTranslations = filterTranslationEntries(
       payload.translations,
@@ -904,12 +1067,13 @@ export const useLiveTranslation = () => {
     );
 
     if (Object.keys(filteredServerTranslations).length > 0) {
+      // Apply server-provided translations immediately into channel state so UI can show them
       channel.translations = {
         ...channel.translations,
         ...filteredServerTranslations,
       };
-      channel.detectedLanguage =
-        payload.detectedLanguage ?? channel.detectedLanguage;
+      channel.detectedLanguage = payload.detectedLanguage ??
+        channel.detectedLanguage;
       channel.liveTranscript = "";
       channel.isTranslating = false;
       setChannelStatus(channel, "Translations updated", "success");
@@ -920,16 +1084,13 @@ export const useLiveTranslation = () => {
           .forEach(([target, entry]) => speak(entry.primary, target));
       }
 
-      conversationHistoryPush({
-        id: createId(),
-        channelId: channel.id,
-        channelLabel: channel.label,
-        sourceLanguage: channel.sourceLanguage,
-        detectedLanguage: channel.detectedLanguage,
-        transcript: channel.lastFinalTranscript,
-        translations: filteredServerTranslations,
-        timestamp: new Date().toISOString(),
-      });
+      // Schedule the final history push — wait briefly to ensure the transcript has stabilized
+      scheduleFinalHistoryPush(
+        channel,
+        assembledFinal,
+        filteredServerTranslations,
+        payload.detectedLanguage ?? null,
+      );
       return;
     }
 
@@ -939,91 +1100,9 @@ export const useLiveTranslation = () => {
       return;
     }
 
-    setChannelStatus(channel, "Translating…", "processing");
-    channel.isTranslating = true;
-
-    const translationSource = fullUtterance || deltaUtterance;
-    const alternativeLimit = resolveAlternativeLimit();
-
-    try {
-      const translationResults = await Promise.all(
-        channel.targetLanguages.map(async (target) => {
-          const result = await translateText(
-            translationSource,
-            channel.sourceLanguage === "auto"
-              ? "auto"
-              : channel.sourceLanguage,
-            target,
-            alternativeLimit,
-          );
-          return {
-            target,
-            entry: sanitizeTranslationEntry({
-              primary: result.translatedText,
-              alternatives: Array.isArray(result.alternatives)
-                ? result.alternatives
-                : [],
-            }),
-            detectedLanguage: result.detectedLanguage,
-          };
-        }),
-      );
-
-      const translationMap: Record<string, TranslationEntry> = {};
-      translationResults.forEach((entry) => {
-        if (entry.entry) {
-          translationMap[entry.target] = entry.entry;
-        }
-      });
-
-      if (Object.keys(translationMap).length === 0) {
-        setChannelStatus(
-          channel,
-          "No translations were generated for the latest speech segment.",
-          "info",
-        );
-        channel.liveTranscript = "";
-        channel.isTranslating = false;
-        return;
-      }
-
-      channel.translations = {
-        ...channel.translations,
-        ...translationMap,
-      };
-      const detected = translationResults.find(
-        (entry) => entry.detectedLanguage,
-      )?.detectedLanguage;
-      channel.detectedLanguage = detected ?? channel.detectedLanguage;
-      setChannelStatus(channel, "Translations updated", "success");
-      channel.liveTranscript = "";
-
-      if (channel.autoSpeak) {
-        Object.entries(translationMap)
-          .filter(([, entry]) => entry.primary.length > 0)
-          .forEach(([target, entry]) => speak(entry.primary, target));
-      }
-
-      conversationHistoryPush({
-        id: createId(),
-        channelId: channel.id,
-        channelLabel: channel.label,
-        sourceLanguage: channel.sourceLanguage,
-        detectedLanguage: channel.detectedLanguage,
-        transcript: channel.lastFinalTranscript,
-        translations: translationMap,
-        timestamp: new Date().toISOString(),
-      });
-    } catch (error) {
-      console.error("Translation error", error);
-      setChannelStatus(
-        channel,
-        "Failed to translate the latest speech segment.",
-        "error",
-      );
-    } finally {
-      channel.isTranslating = false;
-    }
+    // Schedule a delayed finalization: translations will be performed just-in-time
+    // after the transcript has stabilized to avoid pushing partial results.
+    scheduleFinalHistoryPush(channel, assembledFinal, null, null);
   };
 
   const startChannel = async (channel: ConversationChannel): Promise<void> => {
@@ -1091,7 +1170,9 @@ export const useLiveTranslation = () => {
     channel: ConversationChannel,
   ): Promise<void> => {
     const mode = activeTranscriptionModes.get(channel.id);
-    const manager = mode ? transcriptionManagers[mode] : chunkedTranscriptionManager;
+    const manager = mode
+      ? transcriptionManagers[mode]
+      : chunkedTranscriptionManager;
     activeTranscriptionModes.delete(channel.id);
 
     await manager.stop(channel.id);
@@ -1243,6 +1324,10 @@ export const useLiveTranslation = () => {
         channel.systemStream = undefined;
       }
     });
+    // Clear any scheduled final-history timers
+    finalHistoryTimers.forEach((timer) => clearTimeout(timer));
+    finalHistoryTimers.clear();
+    finalHistoryAttempts.clear();
   });
 
   return {

@@ -13,10 +13,10 @@ export const normalizeTranslationMap = (
       return trimmed.length > 0 ? trimmed : null;
     }
     if (value && typeof value === "object") {
-      const candidate = (value as Record<string, unknown>).translatedText
-        ?? (value as Record<string, unknown>).translation
-        ?? (value as Record<string, unknown>).text
-        ?? (value as Record<string, unknown>).value;
+      const candidate = (value as Record<string, unknown>).translatedText ??
+        (value as Record<string, unknown>).translation ??
+        (value as Record<string, unknown>).text ??
+        (value as Record<string, unknown>).value;
       if (typeof candidate === "string") {
         const trimmed = candidate.trim();
         return trimmed.length > 0 ? trimmed : null;
@@ -38,7 +38,8 @@ export const normalizeTranslationMap = (
 
       if (value && typeof value === "object") {
         const primaryValue = (value as { primary?: unknown }).primary;
-        const alternativesValue = (value as { alternatives?: unknown }).alternatives;
+        const alternativesValue =
+          (value as { alternatives?: unknown }).alternatives;
 
         let primary = typeof primaryValue === "string"
           ? primaryValue.trim()
@@ -51,7 +52,9 @@ export const normalizeTranslationMap = (
 
         const uniqueAlternatives = alternatives
           .filter((option) => option.length > 0)
-          .filter((entry, index, arr) => arr.indexOf(entry) === index && entry !== primary);
+          .filter((entry, index, arr) =>
+            arr.indexOf(entry) === index && entry !== primary
+          );
 
         const normalizedAlternatives = !primary && uniqueAlternatives.length > 0
           ? uniqueAlternatives.slice(1)

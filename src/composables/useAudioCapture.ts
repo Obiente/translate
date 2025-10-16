@@ -164,11 +164,10 @@ export function useAudioCapture() {
 
       if (!isFirefox) {
         const [track] = audioTracks;
-        const supported =
-          typeof navigator !== "undefined" &&
+        const supported = typeof navigator !== "undefined" &&
             navigator.mediaDevices?.getSupportedConstraints
-            ? navigator.mediaDevices.getSupportedConstraints()
-            : {};
+          ? navigator.mediaDevices.getSupportedConstraints()
+          : {};
         const desiredConstraints: MediaTrackConstraints = {};
         if ("echoCancellation" in supported) {
           desiredConstraints.echoCancellation = false;

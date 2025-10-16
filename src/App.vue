@@ -1,6 +1,6 @@
 <template>
-  <div class="app">
-    <header class="page-header">
+  <div class="app" :class="{ 'app-focused': showFocusedView }">
+    <header class="page-header" v-if="!showFocusedView">
       <h1>Live Multi-Source Translator</h1>
       <p>
         Add participants, pick their input sources, and let the app translate
@@ -8,13 +8,13 @@
       </p>
     </header>
 
-    <section class="global-status" v-if="globalStatus">
+    <section class="global-status" v-if="globalStatus && !showFocusedView">
       <div class="status-indicator" :class="globalStatus.type">
         {{ globalStatus.message }}
       </div>
     </section>
 
-    <section class="workspace">
+    <section class="workspace" v-if="!showFocusedView">
       <aside class="participants-panel">
         <header class="panel-header">
           <h2>Participants</h2>
@@ -310,14 +310,21 @@
               >
                 <strong>{{ getLanguageName(code) }}:</strong>
                 <span>
-                  {{ translation.primary || translation.alternatives[0] || "—" }}
+                  {{
+                    translation.primary || translation.alternatives[0] || "—"
+                  }}
                 </span>
                 <ul
-                  v-if="showTranslationAlternatives && translation.alternatives.length"
+                  v-if="
+                    showTranslationAlternatives &&
+                    getUniqueAlternatives(translation).length
+                  "
                   class="translation-alternatives"
                 >
                   <li
-                    v-for="(alternative, index) in translation.alternatives"
+                    v-for="(alternative, index) in getUniqueAlternatives(
+                      translation
+                    )"
                     :key="index"
                   >
                     {{ alternative }}
@@ -339,12 +346,15 @@
               <p>{{ translation.primary }}</p>
               <ul
                 v-if="
-                  showTranslationAlternatives && translation.alternatives.length
+                  showTranslationAlternatives &&
+                  getUniqueAlternatives(translation).length
                 "
                 class="translation-alternatives"
               >
                 <li
-                  v-for="(alternative, index) in translation.alternatives"
+                  v-for="(alternative, index) in getUniqueAlternatives(
+                    translation
+                  )"
                   :key="index"
                 >
                   {{ alternative }}
@@ -366,92 +376,58 @@
       </div>
     </section>
 
-    <section class="live-overview">
-      <header class="overview-header">
-        <h2>Live Overview</h2>
-        <span class="participant-count">{{ channels.length }}</span>
+    <!-- Normal conversation view -->
+    <section class="conversation-feed" v-if="!showFocusedView">
+      <header class="feed-header">
+        <h2>Live Conversation</h2>
+        <div class="feed-controls">
+          <button
+            class="button focus-toggle"
+            :class="{ active: showFocusedView }"
+            @click="showFocusedView = !showFocusedView"
+            type="button"
+          >
+            {{ showFocusedView ? "📋 Normal View" : "🎯 Focus View" }}
+          </button>
+          <label class="alternatives-toggle">
+            <input type="checkbox" v-model="showTranslationAlternatives" />
+            Show alternatives
+          </label>
+          <span class="participant-count"
+            >{{ channels.filter((c) => c.isActive).length }} active</span
+          >
+        </div>
       </header>
-      <div class="overview-grid">
-        <article
-          class="overview-card"
-          v-for="channel in channels"
-          :key="channel.id"
-          :class="{ active: channel.isActive }"
-        >
-          <header class="overview-card-header">
-            <strong>{{ channel.label }}</strong>
-            <small v-if="channel.status">{{ channel.status.message }}</small>
-          </header>
 
-          <div class="overview-transcript">
-            <span class="label">Live</span>
-            <span>{{ channel.liveTranscript || "—" }}</span>
-          </div>
-
-          <div class="overview-transcript">
-            <span class="label">Last</span>
-            <span>{{ channel.lastFinalTranscript || "—" }}</span>
-          </div>
-
-          <ul
-            class="overview-translations live"
-            v-if="Object.keys(channel.liveTranslations).length"
-          >
-            <li
-              v-for="(translation, code) in channel.liveTranslations"
-              :key="code"
-            >
-              <strong>{{ getLanguageName(code) }} (live):</strong>
-              <span>
-                {{ translation.primary || translation.alternatives[0] || "—" }}
-              </span>
-              <ul
-                v-if="showTranslationAlternatives && translation.alternatives.length"
-                class="translation-alternatives compact"
-              >
-                <li
-                  v-for="(alternative, index) in translation.alternatives"
-                  :key="index"
-                >
-                  {{ alternative }}
-                </li>
-              </ul>
-            </li>
-          </ul>
-
-          <ul
-            class="overview-translations"
-            v-if="Object.keys(channel.translations).length"
-          >
-            <li v-for="(translation, code) in channel.translations" :key="code">
-              <strong>{{ getLanguageName(code) }}:</strong>
-              {{ translation.primary }}
-              <ul
-                v-if="
-                  showTranslationAlternatives && translation.alternatives.length
-                "
-                class="translation-alternatives compact"
-              >
-                <li
-                  v-for="(alternative, index) in translation.alternatives"
-                  :key="index"
-                >
-                  {{ alternative }}
-                </li>
-              </ul>
-            </li>
-          </ul>
-          <p
-            v-else-if="!Object.keys(channel.liveTranslations).length"
-            class="placeholder"
-          >
-            No translations yet.
-          </p>
-        </article>
-      </div>
+      <ConversationFeed
+        :channels="channels"
+        :recent-history="recentHistory"
+        :show-translation-alternatives="showTranslationAlternatives"
+        :is-speaking="isSpeaking"
+        :get-language-flag="getLanguageFlag"
+        :get-language-name="getLanguageName"
+        :get-unique-alternatives="getUniqueAlternatives"
+        :format-time="formatTime"
+        :select-alternative="selectAlternative"
+        :play-translation="playTranslation"
+      />
     </section>
 
-    <section class="history">
+    <!-- Focused transcription view - Full Screen -->
+    <FocusedView
+      v-if="showFocusedView"
+      :channels="channels"
+      :recent-history="recentHistory"
+      :get-language-flag="getLanguageFlag"
+      :get-language-name="getLanguageName"
+      :show-focused-view="showFocusedView"
+      :toggle-channel="toggleChannel"
+      :add-microphone-channel="addMicrophoneChannel"
+      :add-system-channel="addSystemChannel"
+      @toggle-focus="showFocusedView = !showFocusedView"
+    />
+
+    <section class="history" v-if="!showFocusedView">
       <h2>Recent History</h2>
       <div class="history-list" v-if="recentHistory.length">
         <article
@@ -470,12 +446,15 @@
               {{ translation.primary }}
               <ul
                 v-if="
-                  showTranslationAlternatives && translation.alternatives.length
+                  showTranslationAlternatives &&
+                  getUniqueAlternatives(translation).length
                 "
                 class="translation-alternatives compact"
               >
                 <li
-                  v-for="(alternative, index) in translation.alternatives"
+                  v-for="(alternative, index) in getUniqueAlternatives(
+                    translation
+                  )"
                   :key="index"
                 >
                   {{ alternative }}
@@ -491,7 +470,14 @@
 </template>
 
 <script setup lang="ts">
+  import { ref } from "vue";
   import { useLiveTranslation } from "./composables/useLiveTranslation";
+  import FocusedView from "./components/FocusedView.vue";
+  import ConversationFeed from "./components/ConversationFeed.vue";
+  import "./app.css";
+
+  // Local reactive state
+  const showFocusedView = ref(true);
 
   const {
     languages,
@@ -521,6 +507,93 @@
     refreshAudioInputs,
     resolveMicrophoneLabel,
   } = useLiveTranslation();
+
+  // Helper functions for the improved UI
+  const getLanguageFlag = (code: string): string => {
+    const flags: Record<string, string> = {
+      en: "🇺🇸",
+      es: "🇪🇸",
+      fr: "🇫🇷",
+      de: "🇩🇪",
+      it: "🇮🇹",
+      pt: "🇵🇹",
+      ru: "🇷🇺",
+      ja: "🇯🇵",
+      ko: "🇰🇷",
+      zh: "🇨🇳",
+      ar: "🇸🇦",
+      hi: "🇮🇳",
+      tr: "🇹🇷",
+      pl: "🇵🇱",
+      nl: "🇳🇱",
+    };
+    return flags[code] || "🌐";
+  };
+
+  const formatTime = (timestamp: number | string): string => {
+    const date =
+      typeof timestamp === "string" ? new Date(timestamp) : new Date(timestamp);
+    return date.toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  };
+
+  const selectAlternative = (
+    channelId: string,
+    languageCode: string,
+    alternative: string
+  ) => {
+    const channel = channels.value.find((c) => c.id === channelId);
+    if (channel && channel.liveTranslations[languageCode]) {
+      // Move selected alternative to primary position
+      const translation = channel.liveTranslations[languageCode];
+      const alternatives = [...translation.alternatives];
+      const altIndex = alternatives.indexOf(alternative);
+      if (altIndex > -1) {
+        alternatives.splice(altIndex, 1);
+        alternatives.unshift(translation.primary);
+        translation.primary = alternative;
+        translation.alternatives = alternatives;
+      }
+    }
+  };
+
+  const playTranslation = async (text: string, languageCode: string) => {
+    if (isSpeaking.value) return;
+    try {
+      // Use the composable's speak functionality if available
+      if (typeof window !== "undefined" && "speechSynthesis" in window) {
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.lang = languageCode;
+        window.speechSynthesis.speak(utterance);
+      }
+    } catch (error) {
+      console.warn("TTS failed:", error);
+    }
+  };
+
+  // Helper function to get unique alternatives, excluding duplicates and the primary translation
+  const getUniqueAlternatives = (translation: any): string[] => {
+    if (
+      !translation ||
+      !translation.alternatives ||
+      !Array.isArray(translation.alternatives)
+    ) {
+      return [];
+    }
+
+    const primary = (translation.primary || "").trim();
+    const alternatives = translation.alternatives
+      .filter(
+        (alt: any): alt is string =>
+          typeof alt === "string" && alt.trim() !== "" && alt.trim() !== primary
+      )
+      .map((alt: string) => alt.trim());
+
+    // Remove duplicates using Set
+    return Array.from(new Set(alternatives));
+  };
 
   const alternativeCountOptions = [1, 2, 3, 4, 5];
   defineExpose({
@@ -552,504 +625,3 @@
     resolveMicrophoneLabel,
   });
 </script>
-
-<style scoped>
-  .app {
-    max-width: 1200px;
-    margin: 0 auto;
-    padding: 2rem 1.5rem 4rem;
-    display: flex;
-    flex-direction: column;
-    gap: 2rem;
-  }
-
-  .page-header {
-    text-align: center;
-  }
-
-  .page-header h1 {
-    margin-bottom: 0.5rem;
-    color: #646cff;
-  }
-
-  .global-status {
-    display: flex;
-    justify-content: center;
-  }
-
-  .workspace {
-    display: grid;
-    grid-template-columns: minmax(250px, 320px) 1fr;
-    gap: 1.5rem;
-    align-items: flex-start;
-  }
-
-  .participants-panel {
-    display: flex;
-    flex-direction: column;
-    gap: 1rem;
-    background: rgba(255, 255, 255, 0.03);
-    border-radius: 12px;
-    padding: 1.25rem;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-  }
-
-  .panel-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-
-  .participant-count {
-    background: #646cff;
-    color: #fff;
-    border-radius: 999px;
-    padding: 0.1rem 0.6rem;
-    font-size: 0.85rem;
-  }
-
-  .panel-actions {
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-  }
-
-  .mode-control {
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-    margin-top: 0.75rem;
-  }
-
-  .mode-hint {
-    font-size: 0.85rem;
-    color: #b0b0b0;
-    margin: 0;
-  }
-
-  .mode-hint.warning {
-    color: #ffb74d;
-  }
-
-  .support-hint {
-    color: #ffb74d;
-    font-size: 0.85rem;
-  }
-
-  .participants-list {
-    display: flex;
-    flex-direction: column;
-    gap: 0.75rem;
-    padding: 0;
-    margin: 0;
-    list-style: none;
-  }
-
-  .participant-card {
-    background: rgba(255, 255, 255, 0.03);
-    border-radius: 10px;
-    padding: 0.75rem;
-    border: 1px solid transparent;
-    display: flex;
-    flex-direction: column;
-    gap: 0.75rem;
-    transition: border-color 0.2s, background 0.2s;
-  }
-
-  .participant-card.selected {
-    border-color: #646cff;
-    background: rgba(100, 108, 255, 0.12);
-  }
-
-  .participant-card.active {
-    border-color: rgba(76, 175, 80, 0.6);
-  }
-
-  .participant-select {
-    border: none;
-    background: transparent;
-    color: inherit;
-    font: inherit;
-    width: 100%;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 0.75rem;
-    cursor: pointer;
-    text-align: left;
-  }
-
-  .participant-label span {
-    font-weight: 600;
-  }
-
-  .participant-label small {
-    display: block;
-    margin-top: 0.25rem;
-    color: #b0b0b0;
-    font-size: 0.85rem;
-  }
-
-  .participant-state {
-    font-size: 0.85rem;
-    color: #b0b0b0;
-  }
-
-  .participant-state.listening {
-    color: #4caf50;
-  }
-
-  .participant-controls {
-    display: flex;
-    gap: 0.5rem;
-  }
-
-  .participant-status {
-    margin-top: 0.5rem;
-  }
-
-  .empty-hint {
-    color: #b0b0b0;
-    font-size: 0.9rem;
-  }
-
-  .detail-panel {
-    background: rgba(255, 255, 255, 0.04);
-    border-radius: 12px;
-    padding: 1.5rem;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    display: flex;
-    flex-direction: column;
-    gap: 1.5rem;
-    min-height: 100%;
-  }
-
-  .detail-panel.empty {
-    align-items: center;
-    justify-content: center;
-    text-align: center;
-  }
-
-  .detail-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-start;
-    gap: 1rem;
-  }
-
-  .detail-header h2 {
-    margin: 0;
-    font-size: 1.4rem;
-  }
-
-  .channel-meta {
-    margin: 0.35rem 0 0;
-    color: #b0b0b0;
-    font-size: 0.9rem;
-  }
-
-  .detail-actions {
-    display: flex;
-    gap: 0.75rem;
-  }
-
-  .detail-controls {
-    display: grid;
-    gap: 1rem;
-    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-    align-items: end;
-  }
-
-  .control-group {
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-  }
-
-  select,
-  input[type="checkbox"],
-  button,
-  input[type="text"] {
-    font: inherit;
-  }
-
-  select,
-  input[type="text"] {
-    background: rgba(0, 0, 0, 0.35);
-    color: inherit;
-    border: 1px solid rgba(255, 255, 255, 0.15);
-    border-radius: 6px;
-    padding: 0.5rem;
-  }
-
-  .auto-speak-toggle {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    font-size: 0.95rem;
-  }
-
-  .button {
-    border: 1px solid rgba(255, 255, 255, 0.2);
-    background: rgba(255, 255, 255, 0.08);
-    color: inherit;
-    padding: 0.5rem 1rem;
-    border-radius: 6px;
-    cursor: pointer;
-    transition: background 0.2s;
-  }
-
-  .button.primary {
-    background: #646cff;
-    border-color: #646cff;
-    color: #fff;
-  }
-
-  .button.primary.danger {
-    background: #ef5350;
-    border-color: #ef5350;
-  }
-
-  .button:hover:not(:disabled) {
-    background: rgba(255, 255, 255, 0.15);
-  }
-
-  .button:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
-  .button.active {
-    background: #ef5350;
-    border-color: #ef5350;
-  }
-
-  .detail-transcript {
-    display: grid;
-    gap: 1rem;
-  }
-
-  .transcript-current,
-  .transcript-final {
-    background: rgba(0, 0, 0, 0.3);
-    border-radius: 8px;
-    padding: 1rem;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-  }
-
-  .placeholder {
-    color: #a0a0a0;
-    font-style: italic;
-  }
-
-  .detail-translations {
-    display: flex;
-    flex-direction: column;
-    gap: 0.75rem;
-  }
-
-  .live-translation-preview {
-    background: rgba(0, 0, 0, 0.25);
-    border-radius: 6px;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    padding: 0.75rem;
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-  }
-
-  .live-translation-preview h4 {
-    margin: 0;
-    font-size: 1rem;
-    color: #dcdcff;
-  }
-
-  .live-translation-preview ul {
-    margin: 0;
-    padding-left: 0;
-    list-style: none;
-    display: grid;
-    gap: 0.4rem;
-  }
-
-  .translations-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 1rem;
-  }
-
-  .alternatives-toggle {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    font-size: 0.9rem;
-    color: #d0d0d0;
-  }
-
-  .translation-list {
-    display: grid;
-    gap: 0.75rem;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  }
-
-  .translation-item {
-    background: rgba(0, 0, 0, 0.25);
-    padding: 0.75rem;
-    border-radius: 6px;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-  }
-
-  .translation-alternatives {
-    margin: 0.5rem 0 0;
-    padding-left: 1.1rem;
-    display: grid;
-    gap: 0.25rem;
-    color: #d0d0d0;
-    font-size: 0.9rem;
-    list-style: disc;
-  }
-
-  .translation-alternatives.compact {
-    margin-top: 0.25rem;
-  }
-
-  .live-overview {
-    display: flex;
-    flex-direction: column;
-    gap: 1rem;
-  }
-
-  .overview-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-  }
-
-  .overview-grid {
-    display: grid;
-    gap: 1rem;
-    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  }
-
-  .overview-card {
-    background: rgba(0, 0, 0, 0.3);
-    border-radius: 10px;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    padding: 1rem;
-    display: flex;
-    flex-direction: column;
-    gap: 0.75rem;
-  }
-
-  .overview-card.active {
-    border-color: rgba(76, 175, 80, 0.6);
-  }
-
-  .overview-card-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-    gap: 0.75rem;
-  }
-
-  .overview-transcript {
-    display: flex;
-    gap: 0.5rem;
-  }
-
-  .overview-transcript .label {
-    color: #b0b0b0;
-    font-size: 0.85rem;
-  }
-
-  .overview-translations {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    display: grid;
-    gap: 0.4rem;
-  }
-
-  .overview-translations.live {
-    opacity: 0.85;
-  }
-
-  .tts-indicator {
-    color: #ffb74d;
-    font-size: 0.9rem;
-  }
-
-  .status-indicator {
-    padding: 0.75rem 1rem;
-    border-radius: 6px;
-  }
-
-  .status-indicator.info {
-    background: rgba(100, 148, 255, 0.2);
-  }
-
-  .status-indicator.success {
-    background: rgba(76, 175, 80, 0.2);
-  }
-
-  .status-indicator.error {
-    background: rgba(244, 67, 54, 0.2);
-  }
-
-  .status-indicator.processing,
-  .status-indicator.listening {
-    background: rgba(255, 213, 79, 0.2);
-  }
-
-  .history {
-    display: flex;
-    flex-direction: column;
-    gap: 1rem;
-  }
-
-  .history-list {
-    display: grid;
-    gap: 1rem;
-  }
-
-  .history-item {
-    background: rgba(0, 0, 0, 0.35);
-    border-radius: 8px;
-    padding: 1rem;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-  }
-
-  .history-item header {
-    display: flex;
-    justify-content: space-between;
-    margin-bottom: 0.5rem;
-  }
-
-  .history-item ul {
-    margin: 0.5rem 0 0;
-    padding-left: 1rem;
-    display: grid;
-    gap: 0.25rem;
-  }
-
-  @media (min-width: 540px) {
-    .panel-actions {
-      flex-direction: row;
-    }
-  }
-
-  @media (max-width: 860px) {
-    .workspace {
-      grid-template-columns: 1fr;
-    }
-
-    .detail-panel {
-      order: 2;
-    }
-
-    .participants-panel {
-      order: 1;
-    }
-  }
-</style>

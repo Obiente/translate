@@ -36,7 +36,6 @@ interface RecorderEntry {
     channel: ConversationChannel;
 }
 
-
 const resolveMimeType = (): string | undefined => {
     if (typeof MediaRecorder === "undefined") {
         return undefined;
@@ -432,7 +431,7 @@ export const useWhisperTranscriber = (
         recorders.set(channel.id, entry);
         activeChannels.add(channel.id);
         previousTranscripts.delete(channel.id);
-    sequenceCounters.set(channel.id, 0);
+        sequenceCounters.set(channel.id, 0);
 
         updateStatus(channel, "Listening…", "listening");
         channel.liveTranscript = "";

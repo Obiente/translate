@@ -1,4 +1,4 @@
-import { computed, ref, type Ref } from "vue";
+import { computed, type Ref, ref } from "vue";
 import type { ConversationChannel } from "../../types/conversation";
 
 export interface MicrophoneOption {
@@ -24,7 +24,7 @@ interface UseMicrophoneManagerOptions {
 }
 
 export const useMicrophoneManager = (
-  options: UseMicrophoneManagerOptions
+  options: UseMicrophoneManagerOptions,
 ): MicrophoneManager => {
   const { channels, enumerateAudioInputs } = options;
 
@@ -36,12 +36,11 @@ export const useMicrophoneManager = (
       .filter((device) => device.deviceId !== "default")
       .map((device, index) => ({
         deviceId: device.deviceId,
-        label:
-          device.label && device.label.trim().length > 0
-            ? device.label
-            : device.deviceId === "communications"
-            ? "Communications microphone"
-            : `Microphone ${index + 1}`,
+        label: device.label && device.label.trim().length > 0
+          ? device.label
+          : device.deviceId === "communications"
+          ? "Communications microphone"
+          : `Microphone ${index + 1}`,
       }))
       .sort((a, b) => a.label.localeCompare(b.label))
   );
@@ -72,8 +71,8 @@ export const useMicrophoneManager = (
           return;
         }
         if (!channel.microphoneDeviceId) {
-          const defaultLabel =
-            labelLookup.get("default") || labelLookup.get("") || null;
+          const defaultLabel = labelLookup.get("default") ||
+            labelLookup.get("") || null;
           if (defaultLabel && defaultLabel.trim().length > 0) {
             channel.microphoneDeviceLabel = defaultLabel;
           }
@@ -98,7 +97,7 @@ export const useMicrophoneManager = (
 
     if (channel.microphoneDeviceId) {
       const match = audioInputOptions.value.find(
-        (option) => option.deviceId === channel.microphoneDeviceId
+        (option) => option.deviceId === channel.microphoneDeviceId,
       );
       const label = match?.label ?? channel.microphoneDeviceLabel;
       if (label && label.trim().length > 0) {
@@ -129,7 +128,7 @@ export const useMicrophoneManager = (
       return;
     }
     const match = audioInputOptions.value.find(
-      (option) => option.deviceId === channel.microphoneDeviceId
+      (option) => option.deviceId === channel.microphoneDeviceId,
     );
     if (match) {
       channel.microphoneDeviceLabel = match.label;
@@ -148,16 +147,16 @@ export const useMicrophoneManager = (
           (channel) =>
             channel.sourceType === "microphone" &&
             channel.microphoneDeviceId &&
-            channel.microphoneDeviceId !== "default"
+            channel.microphoneDeviceId !== "default",
         )
-        .map((channel) => channel.microphoneDeviceId as string)
+        .map((channel) => channel.microphoneDeviceId as string),
     );
 
     const candidate = audioInputOptions.value.find(
       (option) =>
         option.deviceId &&
         option.deviceId !== "default" &&
-        !usedDeviceIds.has(option.deviceId)
+        !usedDeviceIds.has(option.deviceId),
     );
     return candidate?.deviceId ?? null;
   };
@@ -171,7 +170,7 @@ export const useMicrophoneManager = (
   };
 
   const ensureStream = async (
-    channel: ConversationChannel
+    channel: ConversationChannel,
   ): Promise<void> => {
     if (channel.sourceType !== "microphone") {
       return;
@@ -179,7 +178,7 @@ export const useMicrophoneManager = (
 
     const existing = channel.microphoneStream;
     const hasLiveTrack = existing?.getAudioTracks().some(
-      (track) => track.readyState === "live"
+      (track) => track.readyState === "live",
     );
     if (existing && hasLiveTrack) {
       return;
@@ -202,14 +201,14 @@ export const useMicrophoneManager = (
 
     const constraints: MediaStreamConstraints = channel.microphoneDeviceId
       ? {
-          audio: {
-            ...trackConstraints,
-            deviceId: { exact: channel.microphoneDeviceId },
-          },
-        }
+        audio: {
+          ...trackConstraints,
+          deviceId: { exact: channel.microphoneDeviceId },
+        },
+      }
       : {
-          audio: trackConstraints,
-        };
+        audio: trackConstraints,
+      };
 
     const stream = await navigator.mediaDevices.getUserMedia(constraints);
     channel.microphoneStream = stream;

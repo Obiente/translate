@@ -1,4 +1,9 @@
-export type StatusType = "info" | "success" | "error" | "processing" | "listening";
+export type StatusType =
+  | "info"
+  | "success"
+  | "error"
+  | "processing"
+  | "listening";
 
 export interface StatusMessage {
   message: string;
@@ -32,6 +37,7 @@ export interface ConversationChannel {
   isTranslating: boolean;
   status: StatusMessage | null;
   autoSpeak: boolean;
+  isFinal?: boolean; // Tracks if current live transcript is finalized
   systemStream?: MediaStream;
   microphoneDeviceId?: string | null;
   microphoneDeviceLabel?: string | null;
