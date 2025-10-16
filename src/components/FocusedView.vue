@@ -292,24 +292,22 @@
     return Array.from(map.values());
   });
 
-  // Choose a display language across the conversation
-  const chooseDisplayLanguage = (): string | null => {
-    const counts = new Map<string, number>();
-    for (const ch of props.channels) {
-      Object.keys(ch.liveTranslations || {}).forEach((code) => {
-        counts.set(code, (counts.get(code) || 0) + 1);
-      });
+  // Helper: choose the best translation for a given item based on preferred codes
+  const chooseTranslationFor = (
+    translations: Record<string, Translation> | undefined,
+    preferredCodes: string[] | undefined,
+  ): Translation | undefined => {
+    if (!translations) return undefined;
+    const prefs = (preferredCodes || []).map((c) => c.trim()).filter(Boolean);
+    for (const code of prefs) {
+      const t = translations[code];
+      if (t && (t.primary?.trim() || t.alternatives?.length)) return t;
     }
-    if (counts.size === 0) return "en"; // fallback
-    let best: string | null = null;
-    let bestCount = -1;
-    counts.forEach((cnt, code) => {
-      if (cnt > bestCount) {
-        best = code;
-        bestCount = cnt;
-      }
-    });
-    return best;
+    // Sensible defaults: prefer English if present
+    if (translations.en) return translations.en;
+    // Otherwise first available
+    const first = Object.values(translations)[0];
+    return first;
   };
 
   type Segment = {
@@ -320,7 +318,6 @@
     timestamp?: number | string;
   };
   const unifiedFeed = computed(() => {
-    const displayCode = chooseDisplayLanguage();
     const segs: Segment[] = [];
 
     // History first (already finalized), sorted by timestamp ascending
@@ -329,10 +326,12 @@
         new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
     );
     for (const entry of history) {
-      let t: Translation | undefined = undefined;
-      if (displayCode) {
-        t = entry.translations?.[displayCode];
-      }
+      // Prefer the channel's targetLanguages if we can resolve the channel
+      const chPref = props.channels.find((c) => c.id === entry.channelId);
+      const t: Translation | undefined = chooseTranslationFor(
+        entry.translations,
+        (chPref as any)?.targetLanguages as string[] | undefined,
+      );
       const text = (
         t?.primary ||
         (t?.alternatives?.[0] ?? "") ||
@@ -352,10 +351,11 @@
 
     // Live segments (one per channel), placed at the end as the most recent
     for (const ch of props.channels) {
-      let t: Translation | undefined = undefined;
-      if (displayCode) {
-        t = ch.liveTranslations?.[displayCode];
-      }
+      // Choose per-channel based on its own targetLanguages
+      const t: Translation | undefined = chooseTranslationFor(
+        ch.liveTranslations,
+        (ch as any)?.targetLanguages as string[] | undefined,
+      );
       const live = t?.primary
         ? t.primary
         : Array.isArray(t?.alternatives) && t.alternatives.length

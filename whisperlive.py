@@ -627,7 +627,7 @@ class WhisperLiveStreamSession:
             self.target_languages,
             self.translation_alternative_limit,
             vad_filter=True,
-            translate=False,
+            translate=True,
         )
 
         await self._handle_result(result, final_requested)
@@ -749,30 +749,17 @@ class WhisperLiveStreamSession:
         full_text = text
         self.current_text = text
 
-        translations = self.last_translations
-        should_translate = False
+        # Use translations computed by the manager (since translate=True) and maintain cache
         now = time.monotonic()
         if self.target_languages:
-            if is_final:
-                should_translate = True
-            elif full_text != self.last_translation_source and (now - self.last_translation_time) >= STREAM_TRANSLATION_INTERVAL:
-                should_translate = True
-
-        if should_translate:
-            translations, detected_language = await _translate_transcript(
-                full_text,
-                language or self.language_hint,
-                self.target_languages,
-                self.translation_alternative_limit,
-            )
-            if detected_language:
-                language = detected_language
-            self.last_translation_source = full_text
-            self.last_translations = translations
-            self.last_translation_time = now
-        elif not self.target_languages:
+            # Update cache when text changed or at finals
+            if is_final or full_text != self.last_translation_source:
+                self.last_translations = result.translations or {}
+                self.last_translation_source = full_text
+                self.last_translation_time = now
+        else:
             self.last_translations = {}
-            translations = {}
+            self.last_translation_source = ""
 
         translations_payload = self.last_translations if self.last_translation_source == full_text else {}
 
@@ -985,34 +972,45 @@ def _normalize_room_fields(message: Dict[str, object]) -> Tuple[Optional[str], O
 
 
 async def _add_to_room(ws: WebSocket, room_id: str, peer_id: Optional[str], peer_label: Optional[str]) -> None:
+    changed = False
     async with ROOM_LOCK:
-        # Remove from previous room if any
+        # Previous state
         prev = CONNECTION_INFO.get(ws)
         prev_room = prev.get("room_id") if prev else None
-        if prev_room and prev_room in ROOMS:
-            ROOMS[prev_room].discard(ws)
-            if not ROOMS[prev_room]:
-                del ROOMS[prev_room]
+        prev_peer = prev.get("peer_id") if prev else None
+        prev_label = prev.get("peer_label") if prev else None
 
-        # Update connection info
-        CONNECTION_INFO[ws] = {
-            "room_id": room_id,
-            "peer_id": peer_id,
-            "peer_label": peer_label,
-        }
-        ROOMS.setdefault(room_id, set()).add(ws)
+        # Detect no-op
+        if prev_room == room_id and prev_peer == peer_id and prev_label == peer_label:
+            changed = False
+        else:
+            changed = True
+            # Remove from previous room if changing rooms
+            if prev_room and prev_room in ROOMS:
+                ROOMS[prev_room].discard(ws)
+                if not ROOMS[prev_room]:
+                    del ROOMS[prev_room]
 
-    # Ack and roster broadcast outside lock
-    try:
-        await ws.send_json({
-            "type": "room_joined",
-            "room_id": room_id,
-            "peer_id": peer_id,
-            "peer_label": peer_label,
-        })
-    except Exception:
-        pass
-    await _broadcast_room_roster(room_id)
+            # Update connection info and membership
+            CONNECTION_INFO[ws] = {
+                "room_id": room_id,
+                "peer_id": peer_id,
+                "peer_label": peer_label,
+            }
+            ROOMS.setdefault(room_id, set()).add(ws)
+
+    # Only ack/broadcast if something changed
+    if changed:
+        try:
+            await ws.send_json({
+                "type": "room_joined",
+                "room_id": room_id,
+                "peer_id": peer_id,
+                "peer_label": peer_label,
+            })
+        except Exception:
+            pass
+        await _broadcast_room_roster(room_id)
 
 
 async def _leave_room(ws: WebSocket) -> None:
@@ -1269,10 +1267,16 @@ async def websocket_transcribe(websocket: WebSocket):
                 chunk_language_hint = message.get("language")
                 if chunk_language_hint is not None:
                     session.language_hint = chunk_language_hint if chunk_language_hint != "auto" else None
-                # Implicit room join/update if room metadata present in chunks
+                # Implicit room join/update if room metadata present in chunks; avoid no-op to prevent roster spam
                 room_id, peer_id, peer_label = _normalize_room_fields(message)
                 if room_id:
-                    await _add_to_room(websocket, room_id, peer_id, peer_label)
+                    meta = CONNECTION_INFO.get(websocket) or {}
+                    if (
+                        meta.get("room_id") != room_id
+                        or meta.get("peer_id") != peer_id
+                        or meta.get("peer_label") != peer_label
+                    ):
+                        await _add_to_room(websocket, room_id, peer_id, peer_label)
                 
                 await session.add_chunk(
                     chunk_bytes,
