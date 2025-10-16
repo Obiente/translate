@@ -21,7 +21,7 @@ import os
 import time
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple, Set
 
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
@@ -776,6 +776,13 @@ class WhisperLiveStreamSession:
 
         translations_payload = self.last_translations if self.last_translation_source == full_text else {}
 
+        # Base payload to sender (include room metadata if present)
+        # Look up room context from connection
+        meta = CONNECTION_INFO.get(self.websocket) if 'CONNECTION_INFO' in globals() else None
+        room_id = meta.get("room_id") if meta else None
+        peer_id = meta.get("peer_id") if meta else None
+        peer_label = meta.get("peer_label") if meta else None
+
         payload = {
             "type": "transcript",
             "text": delta,
@@ -786,7 +793,21 @@ class WhisperLiveStreamSession:
             "channel_id": self.channel_id,
             "sequence": self.sequence,
         }
+        if room_id:
+            payload.update({"room_id": room_id, "peer_id": peer_id, "peer_label": peer_label})
         await self.websocket.send_json(payload)
+        # Broadcast to room peers (non-sender) so remote clients receive updates
+        if room_id:
+            try:
+                await _broadcast_room_transcript(self.websocket, {
+                    "text": delta,
+                    "fullText": full_text,
+                    "language": language,
+                    "isFinal": is_final,
+                    "translations": translations_payload,
+                }, self.channel_id, self.sequence)
+            except Exception:
+                pass
         self.sequence += 1
         self.last_emit = now_ts
 
@@ -817,6 +838,12 @@ class WhisperLiveStreamSession:
             if detected_language:
                 language = detected_language
         
+        # Include room metadata for sentence finals too
+        meta = CONNECTION_INFO.get(self.websocket) if 'CONNECTION_INFO' in globals() else None
+        room_id = meta.get("room_id") if meta else None
+        peer_id = meta.get("peer_id") if meta else None
+        peer_label = meta.get("peer_label") if meta else None
+
         payload = {
             "type": "transcript",
             "text": sentence_text,  # For sentence finals, text is the complete sentence
@@ -827,7 +854,20 @@ class WhisperLiveStreamSession:
             "channel_id": self.channel_id,
             "sequence": self.sequence,
         }
+        if room_id:
+            payload.update({"room_id": room_id, "peer_id": peer_id, "peer_label": peer_label})
         await self.websocket.send_json(payload)
+        if room_id:
+            try:
+                await _broadcast_room_transcript(self.websocket, {
+                    "text": sentence_text,
+                    "fullText": sentence_text,
+                    "language": language,
+                    "isFinal": True,
+                    "translations": translations,
+                }, self.channel_id, self.sequence)
+            except Exception:
+                pass
         self.sequence += 1
         self.last_emit = now
         
@@ -921,6 +961,160 @@ class WhisperLiveStreamSession:
 
 manager = WhisperLiveManager()
 app = FastAPI(title="WhisperLive Server", version="1.0.0")
+
+
+# ---------------------------------------------------------------------------
+# Room management (server-side broadcast, no P2P)
+# ---------------------------------------------------------------------------
+
+# Track connections and room membership
+ROOMS: Dict[str, Set[WebSocket]] = {}
+CONNECTION_INFO: Dict[WebSocket, Dict[str, Optional[str]]] = {}
+ROOM_LOCK = asyncio.Lock()
+
+
+def _normalize_room_fields(message: Dict[str, object]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    room_id = message.get("room_id") or message.get("roomId")
+    peer_id = message.get("peer_id") or message.get("peerId")
+    peer_label = message.get("peer_label") or message.get("peerLabel")
+    return (
+        str(room_id).strip() if isinstance(room_id, str) and room_id.strip() else None,
+        str(peer_id).strip() if isinstance(peer_id, str) and peer_id.strip() else None,
+        str(peer_label).strip() if isinstance(peer_label, str) and peer_label.strip() else None,
+    )
+
+
+async def _add_to_room(ws: WebSocket, room_id: str, peer_id: Optional[str], peer_label: Optional[str]) -> None:
+    async with ROOM_LOCK:
+        # Remove from previous room if any
+        prev = CONNECTION_INFO.get(ws)
+        prev_room = prev.get("room_id") if prev else None
+        if prev_room and prev_room in ROOMS:
+            ROOMS[prev_room].discard(ws)
+            if not ROOMS[prev_room]:
+                del ROOMS[prev_room]
+
+        # Update connection info
+        CONNECTION_INFO[ws] = {
+            "room_id": room_id,
+            "peer_id": peer_id,
+            "peer_label": peer_label,
+        }
+        ROOMS.setdefault(room_id, set()).add(ws)
+
+    # Ack and roster broadcast outside lock
+    try:
+        await ws.send_json({
+            "type": "room_joined",
+            "room_id": room_id,
+            "peer_id": peer_id,
+            "peer_label": peer_label,
+        })
+    except Exception:
+        pass
+    await _broadcast_room_roster(room_id)
+
+
+async def _leave_room(ws: WebSocket) -> None:
+    async with ROOM_LOCK:
+        info = CONNECTION_INFO.get(ws)
+        if not info:
+            return
+        room_id = info.get("room_id")
+        CONNECTION_INFO[ws] = {"room_id": None, "peer_id": info.get("peer_id"), "peer_label": info.get("peer_label")}
+        if room_id and room_id in ROOMS:
+            ROOMS[room_id].discard(ws)
+            empty = not ROOMS[room_id]
+        else:
+            room_id = None
+            empty = False
+        if room_id and empty:
+            del ROOMS[room_id]
+
+    if room_id:
+        try:
+            await ws.send_json({"type": "room_left", "room_id": room_id})
+        except Exception:
+            pass
+        await _broadcast_room_roster(room_id)
+
+
+async def _remove_connection(ws: WebSocket) -> None:
+    async with ROOM_LOCK:
+        info = CONNECTION_INFO.pop(ws, None)
+        room_id = info.get("room_id") if info else None
+        if room_id and room_id in ROOMS:
+            ROOMS[room_id].discard(ws)
+            empty = not ROOMS[room_id]
+            if empty:
+                del ROOMS[room_id]
+        else:
+            room_id = None
+    if room_id:
+        await _broadcast_room_roster(room_id)
+
+
+def _build_room_roster(room_id: str) -> List[Dict[str, Optional[str]]]:
+    members: List[Dict[str, Optional[str]]] = []
+    seen_peer_ids: Set[str] = set()
+    sockets = ROOMS.get(room_id) or set()
+    for s in sockets:
+        meta = CONNECTION_INFO.get(s) or {}
+        pid = meta.get("peer_id")
+        plabel = meta.get("peer_label")
+        # Deduplicate by peer_id (prefer first seen)
+        if pid and pid in seen_peer_ids:
+            continue
+        if pid:
+            seen_peer_ids.add(pid)
+        members.append({
+            "peer_id": pid,
+            "peer_label": plabel,
+            "channel_id": None,
+        })
+    return members
+
+
+async def _broadcast_room_roster(room_id: str) -> None:
+    sockets = list(ROOMS.get(room_id) or [])
+    if not sockets:
+        return
+    roster = _build_room_roster(room_id)
+    message = {"type": "room_roster", "room_id": room_id, "members": roster}
+    for s in sockets:
+        try:
+            await s.send_json(message)
+        except Exception:
+            continue
+
+
+async def _broadcast_room_transcript(ws: WebSocket, payload: Dict[str, object], channel_id: str, sequence: int) -> None:
+    meta = CONNECTION_INFO.get(ws)
+    if not meta:
+        return
+    room_id = meta.get("room_id")
+    if not room_id:
+        return
+    sockets = list(ROOMS.get(room_id) or [])
+    if not sockets:
+        return
+    # Prepare broadcast payload
+    out = dict(payload)
+    out.update({
+        "type": "room_transcript",
+        "room_id": room_id,
+        "peer_id": meta.get("peer_id"),
+        "peer_label": meta.get("peer_label"),
+        "channel_id": channel_id,
+        "sequence": sequence,
+    })
+    for s in sockets:
+        if s is ws:
+            continue
+        try:
+            await s.send_json(out)
+        except Exception:
+            continue
 
 
 @app.on_event("shutdown")
@@ -1021,6 +1215,10 @@ async def websocket_transcribe(websocket: WebSocket):
                 alternative_limit = _coerce_alternative_limit(
                     message.get("translation_alternatives") or message.get("alternatives")
                 )
+                # Implicit room join if room metadata is present
+                room_id, peer_id, peer_label = _normalize_room_fields(message)
+                if room_id:
+                    await _add_to_room(websocket, room_id, peer_id, peer_label)
                 session = WhisperLiveStreamSession(
                     manager=manager,
                     websocket=websocket,
@@ -1071,6 +1269,10 @@ async def websocket_transcribe(websocket: WebSocket):
                 chunk_language_hint = message.get("language")
                 if chunk_language_hint is not None:
                     session.language_hint = chunk_language_hint if chunk_language_hint != "auto" else None
+                # Implicit room join/update if room metadata present in chunks
+                room_id, peer_id, peer_label = _normalize_room_fields(message)
+                if room_id:
+                    await _add_to_room(websocket, room_id, peer_id, peer_label)
                 
                 await session.add_chunk(
                     chunk_bytes,
@@ -1082,6 +1284,18 @@ async def websocket_transcribe(websocket: WebSocket):
 
             if message_type == "stop":
                 break
+
+            if message_type == "join_room":
+                room_id, peer_id, peer_label = _normalize_room_fields(message)
+                if not room_id:
+                    await websocket.send_json({"type": "error", "detail": "room_id required"})
+                    continue
+                await _add_to_room(websocket, room_id, peer_id, peer_label)
+                continue
+
+            if message_type == "leave_room":
+                await _leave_room(websocket)
+                continue
 
             await websocket.send_json({"type": "error", "detail": "Unsupported message type"})
     except WebSocketDisconnect:
@@ -1098,6 +1312,7 @@ async def websocket_transcribe(websocket: WebSocket):
                 await session.close()
             except Exception:
                 pass
+        await _remove_connection(websocket)
         try:
             await websocket.close()
         except Exception:  # pragma: no cover - already closed

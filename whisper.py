@@ -47,6 +47,107 @@ batched_pipeline = (
     BatchedInferencePipeline(model=model) if WHISPER_BATCH_SIZE > 1 else None
 )
 
+# --- Room management (server-side broadcast of transcripts) ---
+from dataclasses import dataclass
+from typing import Optional, Set, Any
+
+@dataclass
+class ConnectionInfo:
+    websocket: WebSocket
+    room_id: Optional[str] = None
+    peer_id: Optional[str] = None
+    peer_label: Optional[str] = None
+    channel_id: Optional[str] = None
+
+# room_id -> set of WebSocket
+ROOMS: dict[str, Set[WebSocket]] = {}
+# websocket -> ConnectionInfo
+CONNECTIONS: dict[WebSocket, ConnectionInfo] = {}
+
+def _add_to_room(conn: ConnectionInfo, room_id: Optional[str]) -> None:
+    # Remove from previous room
+    if conn.room_id and conn.websocket in ROOMS.get(conn.room_id, set()):
+        try:
+            ROOMS[conn.room_id].discard(conn.websocket)
+            if not ROOMS[conn.room_id]:
+                ROOMS.pop(conn.room_id, None)
+        except Exception:
+            pass
+    # Add to new room
+    if room_id:
+        bucket = ROOMS.get(room_id)
+        if bucket is None:
+            bucket = set()
+            ROOMS[room_id] = bucket
+        bucket.add(conn.websocket)
+        conn.room_id = room_id
+
+def _build_room_roster(room_id: str) -> list[dict[str, Optional[str]]]:
+    members: list[dict[str, Optional[str]]] = []
+    seen_peer_ids: set[str] = set()
+    for ws in ROOMS.get(room_id, set()).copy():
+        info = CONNECTIONS.get(ws)
+        if not info:
+            continue
+        # Deduplicate by peer_id so one user with multiple sockets appears once
+        pid = info.peer_id or None
+        if pid and pid in seen_peer_ids:
+            continue
+        if pid:
+            seen_peer_ids.add(pid)
+        members.append({
+            "peer_id": info.peer_id,
+            "peer_label": info.peer_label,
+            "channel_id": info.channel_id,
+        })
+    return members
+
+async def _broadcast_room_roster(room_id: str) -> None:
+    payload = {
+        "type": "room_roster",
+        "room_id": room_id,
+        "members": _build_room_roster(room_id),
+    }
+    # send to all without filtering self
+    for ws in list(ROOMS.get(room_id, set())):
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            try:
+                ROOMS.get(room_id, set()).discard(ws)
+            except Exception:
+                pass
+            CONNECTIONS.pop(ws, None)
+
+async def _broadcast_to_room(
+    source: ConnectionInfo,
+    payload: dict[str, Any],
+    include_self: bool = False,
+) -> None:
+    room_id = source.room_id
+    if not room_id:
+        return
+    targets = list(ROOMS.get(room_id, set()))
+    for ws in targets:
+        if not include_self and ws is source.websocket:
+            continue
+        # Basic safety: target may have been removed
+        if ws not in CONNECTIONS:
+            try:
+                ROOMS.get(room_id, set()).discard(ws)
+            except Exception:
+                pass
+            continue
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            # Drop dead sockets from room
+            try:
+                ROOMS.get(room_id, set()).discard(ws)
+            except Exception:
+                pass
+            CONNECTIONS.pop(ws, None)
+
 
 @app.on_event("shutdown")
 async def _close_clients() -> None:
@@ -749,6 +850,9 @@ async def transcribe_audio(
 @app.websocket("/ws/transcribe")
 async def websocket_transcribe(websocket: WebSocket):
     await websocket.accept()
+    # Track this connection
+    conn = ConnectionInfo(websocket=websocket)
+    CONNECTIONS[websocket] = conn
 
     # Session state
     channel_id: str | None = None
@@ -881,6 +985,43 @@ async def websocket_transcribe(websocket: WebSocket):
                 # Ignore client pong responses (useful if server ever initiates keepalive)
                 continue
 
+            if message_type == "join_room":
+                # Client requests to join a logical room without audio peering
+                requested_room = message.get("room_id") or message.get("roomId")
+                peer_id = message.get("peer_id") or message.get("peerId")
+                peer_label = message.get("peer_label") or message.get("peerLabel")
+                if isinstance(requested_room, str) and requested_room.strip():
+                    # Ensure every connection has a peer_id
+                    if isinstance(peer_id, str) and peer_id.strip():
+                        conn.peer_id = peer_id.strip()
+                    else:
+                        conn.peer_id = conn.peer_id or str(uuid4())
+                    conn.peer_label = str(peer_label) if isinstance(peer_label, str) else None
+                    _add_to_room(conn, requested_room.strip())
+                    await websocket.send_json({
+                        "type": "room_joined",
+                        "room_id": conn.room_id,
+                        "peer_id": conn.peer_id,
+                        "peer_label": conn.peer_label,
+                    })
+                    # Broadcast updated roster to the room
+                    if conn.room_id:
+                        await _broadcast_room_roster(conn.room_id)
+                else:
+                    await websocket.send_json({
+                        "type": "error",
+                        "detail": "Missing or invalid room_id",
+                    })
+                continue
+
+            if message_type == "leave_room":
+                prev = conn.room_id
+                _add_to_room(conn, None)
+                await websocket.send_json({"type": "room_left"})
+                if prev:
+                    await _broadcast_room_roster(prev)
+                continue
+
             if message_type == "start":
                 print(f"DEBUG: Received start message: {message}")
                 # Initialize new session
@@ -919,6 +1060,31 @@ async def websocket_transcribe(websocket: WebSocket):
                     raw_alternative_limit
                 )
                 
+                conn.channel_id = channel_id
+                # Optional: allow implicit room join via start payload for robustness
+                try:
+                    requested_room = message.get("room_id") or message.get("roomId")
+                    peer_id = message.get("peer_id") or message.get("peerId")
+                    peer_label = message.get("peer_label") or message.get("peerLabel")
+                    if isinstance(requested_room, str) and requested_room.strip():
+                        if isinstance(peer_id, str) and peer_id.strip():
+                            conn.peer_id = peer_id.strip()
+                        else:
+                            conn.peer_id = conn.peer_id or str(uuid4())
+                        conn.peer_label = str(peer_label) if isinstance(peer_label, str) else conn.peer_label
+                        # Idempotent add/switch room
+                        _add_to_room(conn, requested_room.strip())
+                        await websocket.send_json({
+                            "type": "room_joined",
+                            "room_id": conn.room_id,
+                            "peer_id": conn.peer_id,
+                            "peer_label": conn.peer_label,
+                        })
+                        if conn.room_id:
+                            await _broadcast_room_roster(conn.room_id)
+                except Exception:
+                    # Non-fatal: continue even if implicit join fails
+                    pass
                 await websocket.send_json({
                     "type": "session_started",
                     "channel_id": channel_id
@@ -933,6 +1099,32 @@ async def websocket_transcribe(websocket: WebSocket):
                         {"type": "error", "detail": "Streaming session not initialized."}
                     )
                     continue
+
+                # Optional: allow implicit room join/switch via chunk payload (idempotent)
+                try:
+                    requested_room = message.get("room_id") or message.get("roomId")
+                    peer_id = message.get("peer_id") or message.get("peerId")
+                    peer_label = message.get("peer_label") or message.get("peerLabel")
+                    if isinstance(requested_room, str) and requested_room.strip():
+                        changed_room = requested_room.strip() != (conn.room_id or "")
+                        if isinstance(peer_id, str) and peer_id.strip():
+                            conn.peer_id = peer_id.strip()
+                        else:
+                            conn.peer_id = conn.peer_id or str(uuid4())
+                        conn.peer_label = str(peer_label) if isinstance(peer_label, str) else conn.peer_label
+                        _add_to_room(conn, requested_room.strip())
+                        # Only announce if we actually changed membership
+                        if changed_room:
+                            await websocket.send_json({
+                                "type": "room_joined",
+                                "room_id": conn.room_id,
+                                "peer_id": conn.peer_id,
+                                "peer_label": conn.peer_label,
+                            })
+                            if conn.room_id:
+                                await _broadcast_room_roster(conn.room_id)
+                except Exception:
+                    pass
 
                 # Decode chunk data
                 chunk_data = message.get("data")
@@ -1226,10 +1418,19 @@ async def websocket_transcribe(websocket: WebSocket):
                     }
                     if isinstance(sequence_value, int):
                         response["sequence"] = sequence_value
-                    
+                    # Attach room metadata if present
+                    if conn.room_id:
+                        response["room_id"] = conn.room_id
+                        response["peer_id"] = conn.peer_id
+                        response["peer_label"] = conn.peer_label
+
                     print(f"DEBUG: Sending response: {response}")
                     logger.info(f"Sending response: {response}")
+                    # Send to sender
                     await websocket.send_json(response)
+                    # Also broadcast to room peers, excluding self
+                    if conn.room_id:
+                        await _broadcast_to_room(conn, {**response, "type": "room_transcript"}, include_self=False)
                 else:
                     print(f"DEBUG: Skipping response - empty transcript")
                     logger.info("Skipping response - empty transcript")
@@ -1271,3 +1472,18 @@ async def websocket_transcribe(websocket: WebSocket):
         if channel_id:
             MP4_INITIALIZATION_SEGMENTS.pop(channel_id, None)
             STREAMING_INITIAL_SEGMENTS.pop(channel_id, None)
+        # Cleanup room membership and connection registry
+        try:
+            conn = CONNECTIONS.pop(websocket, None)
+            if conn and conn.room_id:
+                room_id = conn.room_id
+                bucket = ROOMS.get(room_id)
+                if bucket and websocket in bucket:
+                    bucket.discard(websocket)
+                    if not bucket:
+                        ROOMS.pop(room_id, None)
+                # Notify remaining members of updated roster
+                if room_id:
+                    await _broadcast_room_roster(room_id)
+        except Exception:
+            pass
