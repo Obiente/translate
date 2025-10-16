@@ -28,8 +28,8 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, W
 import httpx
 from whisper_live.transcriber.transcriber_faster_whisper import Segment, TranscriptionInfo, WhisperModel
 
-_log_level_name = os.getenv("WHISPERLIVE_LOG_LEVEL", "INFO").strip().upper()
-_log_level = getattr(logging, _log_level_name, logging.INFO)
+_log_level_name = os.getenv("WHISPERLIVE_LOG_LEVEL", "WARNING").strip().upper()
+_log_level = getattr(logging, _log_level_name, logging.WARNING)
 logging.basicConfig(level=_log_level)
 logger = logging.getLogger("whisperlive")
 logger.setLevel(_log_level)
@@ -231,12 +231,14 @@ async def _translate_transcript(
 # ---------------------------------------------------------------------------
 
 DEFAULT_SAMPLE_RATE = 16000
-STREAM_MAX_WINDOW_SECONDS = _env_float("WHISPERLIVE_STREAM_WINDOW", 60.0)
+DEFAULT_STREAM_WINDOW = 5 * 60
+STREAM_MAX_WINDOW_SECONDS = _env_float("WHISPERLIVE_STREAM_WINDOW", DEFAULT_STREAM_WINDOW)
 STREAM_MIN_STEP_SECONDS = _env_float("WHISPERLIVE_STREAM_MIN_STEP", 0.25)
 STREAM_EMIT_INTERVAL = _env_float("WHISPERLIVE_STREAM_MIN_INTERVAL", 0.5)
-STREAM_CONTEXT_SECONDS = _env_float("WHISPERLIVE_STREAM_CONTEXT", 12.0)
+STREAM_CONTEXT_SECONDS = _env_float("WHISPERLIVE_STREAM_CONTEXT", DEFAULT_STREAM_WINDOW * 0.8)  # Increased from 12s to 24s for better accuracy
 STREAM_TRANSLATION_INTERVAL = _env_float("WHISPERLIVE_STREAM_TRANSLATION_INTERVAL", 1.4)
 AUTO_FINAL_REPEAT_THRESHOLD = max(_env_int("WHISPERLIVE_AUTO_FINAL_REPEAT_THRESHOLD", 2), 1)
+SENTENCE_FINAL_REPEAT_THRESHOLD = max(_env_int("WHISPERLIVE_SENTENCE_FINAL_REPEAT_THRESHOLD", 2), 1)
 
 
 def _detect_device() -> Tuple[str, str]:
@@ -250,6 +252,37 @@ def _detect_device() -> Tuple[str, str]:
     except Exception:  # pragma: no cover - torch optional
         pass
     return "cpu", "int8"
+
+
+def _extract_complete_sentences(text: str) -> Tuple[str, str]:
+    """Extract complete sentences from text.
+    
+    Returns:
+        Tuple of (complete_sentences, remaining_text)
+    """
+    if not text.strip():
+        return "", ""
+    
+    # Define sentence-ending punctuation
+    sentence_endings = {'.', '!', '?', '。', '！', '？'}  # Include some common non-English punctuation
+    
+    # Find the last sentence ending
+    last_ending_pos = -1
+    for i, char in enumerate(text):
+        if char in sentence_endings:
+            # Make sure it's not just a decimal number or abbreviation
+            # Simple heuristic: if followed by space and capital letter, it's likely a sentence end
+            if i + 2 < len(text) and text[i + 1] == ' ' and text[i + 2].isupper():
+                last_ending_pos = i
+            elif i == len(text) - 1:  # End of text
+                last_ending_pos = i
+    
+    if last_ending_pos >= 0:
+        complete = text[:last_ending_pos + 1].strip()
+        remaining = text[last_ending_pos + 1:].strip()
+        return complete, remaining
+    
+    return "", text
 
 
 def _resample_audio(audio: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
@@ -489,6 +522,10 @@ class WhisperLiveStreamSession:
         self.last_translation_time = 0.0
         self.repeated_transcript_count = 0
         self.last_repeated_transcript = ""
+        # Sentence-level final tracking
+        self.sentence_repeat_count = 0
+        self.last_sentence_beginning = ""
+        self.confirmed_text_prefix = ""  # Text that has been finalized via sentence completion
         self.lock = asyncio.Lock()
         self.new_audio_event = asyncio.Event()
         self.closed = False
@@ -601,9 +638,60 @@ class WhisperLiveStreamSession:
             return
 
         language = result.language or self.last_language or self.language_hint
+        
+        # Check for sentence-level finals first (for long continuous speech)
+        sentence_final_text = None
+        remaining_text = text
+        
+        if text and not is_final:
+            # Extract complete sentences from the current transcript
+            complete_sentences, remaining = _extract_complete_sentences(text)
+            
+            if complete_sentences:
+                # Check if the beginning of the complete sentences has stabilized
+                sentence_beginning = complete_sentences[:min(50, len(complete_sentences))]  # First 50 chars
+                
+                if sentence_beginning == self.last_sentence_beginning:
+                    self.sentence_repeat_count += 1
+                    logger.debug(
+                        "Sentence beginning repeated",
+                        extra={
+                            "channel_id": self.channel_id,
+                            "sentence_count": self.sentence_repeat_count,
+                            "sentence_preview": sentence_beginning,
+                        },
+                    )
+                else:
+                    self.sentence_repeat_count = 1
+                    self.last_sentence_beginning = sentence_beginning
+                
+                # If sentence beginning is stable, emit it as final
+                now_ts = time.monotonic()
+                should_emit_sentence_final = (
+                    self.sentence_repeat_count >= SENTENCE_FINAL_REPEAT_THRESHOLD
+                    and (now_ts - self.last_emit) >= STREAM_EMIT_INTERVAL
+                    and complete_sentences not in self.confirmed_text_prefix  # Avoid re-emitting
+                )
+                
+                if should_emit_sentence_final:
+                    logger.debug(
+                        "Emitting sentence-level final",
+                        extra={
+                            "channel_id": self.channel_id,
+                            "sentence_count": self.sentence_repeat_count,
+                            "sentences_len": len(complete_sentences),
+                            "remaining_len": len(remaining),
+                        },
+                    )
+                    sentence_final_text = complete_sentences
+                    remaining_text = remaining
+                    self.confirmed_text_prefix = complete_sentences
+                    self.sentence_repeat_count = 0
+                    self.last_sentence_beginning = ""
+        
+        # Standard repeated transcript detection for complete final emission
         delta = _compute_delta(self.last_text, text)
         
-        # Simple repeated transcript detection for final emission
         if text and text == self.last_repeated_transcript:
             self.repeated_transcript_count += 1
             logger.debug(
@@ -620,14 +708,14 @@ class WhisperLiveStreamSession:
 
         # Emit final if we've seen the same transcript enough times
         now_ts = time.monotonic()
-        should_emit_final = (
+        should_emit_full_final = (
             text
             and self.repeated_transcript_count >= AUTO_FINAL_REPEAT_THRESHOLD
             and not is_final
             and (now_ts - self.last_emit) >= STREAM_EMIT_INTERVAL
         )
 
-        if should_emit_final:
+        if should_emit_full_final:
             logger.debug(
                 "Auto-final triggered by repeated transcript",
                 extra={
@@ -639,8 +727,19 @@ class WhisperLiveStreamSession:
             is_final = True
             self.repeated_transcript_count = 0  # Reset after emission
             self.last_repeated_transcript = ""
+            # Clear confirmed prefix since we're finalizing everything
+            self.confirmed_text_prefix = ""
 
-        if not is_final and not delta:
+        # Handle sentence-level final emission
+        if sentence_final_text and not is_final:
+            await self._emit_sentence_final(sentence_final_text, language)
+            # Trim buffer to prevent unlimited growth during long speech
+            await self._shrink_buffer_after_sentence_final()
+            # Continue processing with remaining text for partial updates
+            text = remaining_text
+            delta = _compute_delta(self.last_text, text)
+
+        if not is_final and not delta and not sentence_final_text:
             logger.debug(
                 "Skipping emit: no delta and not final",
                 extra={"channel_id": self.channel_id, "sequence": self.sequence},
@@ -699,12 +798,72 @@ class WhisperLiveStreamSession:
         else:
             await self._shrink_buffer()
 
+    async def _emit_sentence_final(self, sentence_text: str, language: Optional[str]) -> None:
+        """Emit a final event for completed sentences during long continuous speech."""
+        translations = {}
+        should_translate = False
+        now = time.monotonic()
+        
+        if self.target_languages:
+            should_translate = True
+        
+        if should_translate:
+            translations, detected_language = await _translate_transcript(
+                sentence_text,
+                language or self.language_hint,
+                self.target_languages,
+                self.translation_alternative_limit,
+            )
+            if detected_language:
+                language = detected_language
+        
+        payload = {
+            "type": "transcript",
+            "text": sentence_text,  # For sentence finals, text is the complete sentence
+            "fullText": sentence_text,
+            "language": language,
+            "isFinal": True,
+            "translations": translations,
+            "channel_id": self.channel_id,
+            "sequence": self.sequence,
+        }
+        await self.websocket.send_json(payload)
+        self.sequence += 1
+        self.last_emit = now
+        
+        logger.debug(
+            "Sentence final emitted",
+            extra={
+                "channel_id": self.channel_id,
+                "sentence_len": len(sentence_text),
+                "sequence": self.sequence - 1,
+            },
+        )
+
     async def _shrink_buffer(self) -> None:
         if self.context_samples <= 0:
             return
         async with self.lock:
             if self.buffer.size > self.context_samples:
                 self.buffer = self.buffer[-self.context_samples:]
+
+    async def _shrink_buffer_after_sentence_final(self) -> None:
+        """More aggressive buffer trimming after sentence finals to prevent unlimited growth."""
+        if self.context_samples <= 0:
+            return
+        async with self.lock:
+            # Keep less context after sentence finals - maybe 50% of normal context
+            reduced_context = max(self.context_samples // 2, self.min_samples * 2)
+            if self.buffer.size > reduced_context:
+                self.buffer = self.buffer[-reduced_context:]
+                logger.debug(
+                    "Buffer trimmed after sentence final",
+                    extra={
+                        "channel_id": self.channel_id,
+                        "new_buffer_size": self.buffer.size,
+                        "reduced_context_size": reduced_context,
+                    },
+                )
 
     async def _finalize(self, final_requested: bool) -> None:
         async with self.lock:
@@ -718,6 +877,12 @@ class WhisperLiveStreamSession:
             self.last_text = ""
             self.current_text = ""
             self.last_translation_time = 0.0
+            # Reset sentence tracking state
+            self.sentence_repeat_count = 0
+            self.last_sentence_beginning = ""
+            self.confirmed_text_prefix = ""
+            self.repeated_transcript_count = 0
+            self.last_repeated_transcript = ""
 
             self.last_audio_time = now_ts
 
