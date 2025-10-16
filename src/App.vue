@@ -3,7 +3,8 @@
     <header class="page-header">
       <h1>Live Multi-Source Translator</h1>
       <p>
-        Add participants, pick their input sources, and let the app translate conversations in real time.
+        Add participants, pick their input sources, and let the app translate
+        conversations in real time.
       </p>
     </header>
 
@@ -46,10 +47,12 @@
             <option value="streaming">Streaming (beta)</option>
           </select>
           <p class="mode-hint">
-            Chunked uploads send periodic audio blobs. Streaming keeps a live WebSocket open for lower latency.
+            Chunked uploads send periodic audio blobs. Streaming keeps a live
+            WebSocket open for lower latency.
           </p>
           <p class="mode-hint warning" v-if="isAnyChannelActive">
-            Active participants continue using their current mode until restarted.
+            Active participants continue using their current mode until
+            restarted.
           </p>
         </div>
 
@@ -176,7 +179,10 @@
 
           <div class="control-group">
             <label for="source-language">Source language</label>
-            <select id="source-language" v-model="selectedChannel.sourceLanguage">
+            <select
+              id="source-language"
+              v-model="selectedChannel.sourceLanguage"
+            >
               <option value="auto">Auto detect</option>
               <option
                 v-for="language in languages"
@@ -188,7 +194,10 @@
             </select>
           </div>
 
-          <div class="control-group" v-if="selectedChannel.sourceType === 'microphone'">
+          <div
+            class="control-group"
+            v-if="selectedChannel.sourceType === 'microphone'"
+          >
             <label for="microphone-select">Microphone</label>
             <select
               id="microphone-select"
@@ -265,11 +274,27 @@
         <section class="detail-translations">
           <div class="translations-header">
             <h3>Translations</h3>
+
+            <label
+              v-if="showTranslationAlternatives"
+              class="alternatives-count"
+            >
+              Alternatives per language
+              <select
+                v-model.number="translationAlternativesLimit"
+                :disabled="!showTranslationAlternatives"
+              >
+                <option
+                  v-for="option in alternativeCountOptions"
+                  :key="option"
+                  :value="option"
+                >
+                  {{ option }}
+                </option>
+              </select>
+            </label>
             <label class="alternatives-toggle">
-              <input
-                type="checkbox"
-                v-model="showTranslationAlternatives"
-              />
+              <input type="checkbox" v-model="showTranslationAlternatives" />
               Show alternative translations
             </label>
           </div>
@@ -283,7 +308,21 @@
                 v-for="(translation, code) in selectedChannel.liveTranslations"
                 :key="code"
               >
-                <strong>{{ getLanguageName(code) }}:</strong> {{ translation }}
+                <strong>{{ getLanguageName(code) }}:</strong>
+                <span>
+                  {{ translation.primary || translation.alternatives[0] || "—" }}
+                </span>
+                <ul
+                  v-if="showTranslationAlternatives && translation.alternatives.length"
+                  class="translation-alternatives"
+                >
+                  <li
+                    v-for="(alternative, index) in translation.alternatives"
+                    :key="index"
+                  >
+                    {{ alternative }}
+                  </li>
+                </ul>
               </li>
             </ul>
           </div>
@@ -299,7 +338,9 @@
               <strong>{{ getLanguageName(code) }}</strong>
               <p>{{ translation.primary }}</p>
               <ul
-                v-if="showTranslationAlternatives && translation.alternatives.length"
+                v-if="
+                  showTranslationAlternatives && translation.alternatives.length
+                "
                 class="translation-alternatives"
               >
                 <li
@@ -360,7 +401,21 @@
               v-for="(translation, code) in channel.liveTranslations"
               :key="code"
             >
-              <strong>{{ getLanguageName(code) }} (live):</strong> {{ translation }}
+              <strong>{{ getLanguageName(code) }} (live):</strong>
+              <span>
+                {{ translation.primary || translation.alternatives[0] || "—" }}
+              </span>
+              <ul
+                v-if="showTranslationAlternatives && translation.alternatives.length"
+                class="translation-alternatives compact"
+              >
+                <li
+                  v-for="(alternative, index) in translation.alternatives"
+                  :key="index"
+                >
+                  {{ alternative }}
+                </li>
+              </ul>
             </li>
           </ul>
 
@@ -369,9 +424,12 @@
             v-if="Object.keys(channel.translations).length"
           >
             <li v-for="(translation, code) in channel.translations" :key="code">
-              <strong>{{ getLanguageName(code) }}:</strong> {{ translation.primary }}
+              <strong>{{ getLanguageName(code) }}:</strong>
+              {{ translation.primary }}
               <ul
-                v-if="showTranslationAlternatives && translation.alternatives.length"
+                v-if="
+                  showTranslationAlternatives && translation.alternatives.length
+                "
                 class="translation-alternatives compact"
               >
                 <li
@@ -396,7 +454,11 @@
     <section class="history">
       <h2>Recent History</h2>
       <div class="history-list" v-if="recentHistory.length">
-        <article class="history-item" v-for="entry in recentHistory" :key="entry.id">
+        <article
+          class="history-item"
+          v-for="entry in recentHistory"
+          :key="entry.id"
+        >
           <header>
             <span>{{ entry.channelLabel }}</span>
             <span>{{ formatTimestamp(entry.timestamp) }}</span>
@@ -404,9 +466,12 @@
           <p>{{ entry.transcript }}</p>
           <ul>
             <li v-for="(translation, code) in entry.translations" :key="code">
-              <strong>{{ getLanguageName(code) }}:</strong> {{ translation.primary }}
+              <strong>{{ getLanguageName(code) }}:</strong>
+              {{ translation.primary }}
               <ul
-                v-if="showTranslationAlternatives && translation.alternatives.length"
+                v-if="
+                  showTranslationAlternatives && translation.alternatives.length
+                "
                 class="translation-alternatives compact"
               >
                 <li
@@ -426,63 +491,66 @@
 </template>
 
 <script setup lang="ts">
-import { useLiveTranslation } from "./composables/useLiveTranslation";
+  import { useLiveTranslation } from "./composables/useLiveTranslation";
 
-const {
-  languages,
-  channels,
-  selectedChannelId,
-  selectedChannel,
-  recentHistory,
-  globalStatus,
-  showTranslationAlternatives,
-  transcriptionMode,
-  speechSupported,
-  desktopCaptureSupported,
-  hasSystemChannel,
-  isAnyChannelActive,
-  isSpeaking,
-  audioInputOptions,
-  isRefreshingAudioInputs,
-  addMicrophoneChannel,
-  addSystemChannel,
-  removeChannel,
-  toggleChannel,
-  selectChannel,
-  getLanguageName,
-  formatTimestamp,
-  handleMicrophoneSelectionChange,
-  refreshAudioInputs,
-  resolveMicrophoneLabel,
-} = useLiveTranslation();
+  const {
+    languages,
+    channels,
+    selectedChannelId,
+    selectedChannel,
+    recentHistory,
+    globalStatus,
+    showTranslationAlternatives,
+    translationAlternativesLimit,
+    transcriptionMode,
+    speechSupported,
+    desktopCaptureSupported,
+    hasSystemChannel,
+    isAnyChannelActive,
+    isSpeaking,
+    audioInputOptions,
+    isRefreshingAudioInputs,
+    addMicrophoneChannel,
+    addSystemChannel,
+    removeChannel,
+    toggleChannel,
+    selectChannel,
+    getLanguageName,
+    formatTimestamp,
+    handleMicrophoneSelectionChange,
+    refreshAudioInputs,
+    resolveMicrophoneLabel,
+  } = useLiveTranslation();
 
-defineExpose({
-  languages,
-  channels,
-  selectedChannelId,
-  selectedChannel,
-  recentHistory,
-  globalStatus,
-  showTranslationAlternatives,
-  transcriptionMode,
-  speechSupported,
-  desktopCaptureSupported,
-  hasSystemChannel,
-  isAnyChannelActive,
-  isSpeaking,
-  audioInputOptions,
-  isRefreshingAudioInputs,
-  addMicrophoneChannel,
-  addSystemChannel,
-  removeChannel,
-  toggleChannel,
-  selectChannel,
-  getLanguageName,
-  formatTimestamp,
-  handleMicrophoneSelectionChange,
-  refreshAudioInputs,
-  resolveMicrophoneLabel,
-});
+  const alternativeCountOptions = [1, 2, 3, 4, 5];
+  defineExpose({
+    languages,
+    channels,
+    selectedChannelId,
+    selectedChannel,
+    recentHistory,
+    globalStatus,
+    showTranslationAlternatives,
+    translationAlternativesLimit,
+    transcriptionMode,
+    speechSupported,
+    desktopCaptureSupported,
+    hasSystemChannel,
+    isAnyChannelActive,
+    isSpeaking,
+    audioInputOptions,
+    isRefreshingAudioInputs,
+    addMicrophoneChannel,
+    addSystemChannel,
+    removeChannel,
+    toggleChannel,
+    selectChannel,
+    getLanguageName,
+    formatTimestamp,
+    handleMicrophoneSelectionChange,
+    refreshAudioInputs,
+    resolveMicrophoneLabel,
+  });
 </script>
 
 <style scoped>

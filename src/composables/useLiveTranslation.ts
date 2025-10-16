@@ -6,6 +6,7 @@ import {
   HISTORY_STORAGE_KEY,
   SELECTED_CHANNEL_KEY,
   SHOW_TRANSLATION_ALTERNATIVES_KEY,
+  TRANSLATION_ALTERNATIVE_LIMIT_KEY,
   TRANSCRIPTION_MODE_KEY,
 } from "../constants/storage";
 import { useAudioCapture } from "../composables/useAudioCapture";
@@ -23,11 +24,14 @@ import type {
   StatusType,
   TranslationEntry,
 } from "../types/conversation";
+import { normalizeTranslationMap } from "../utils/translation";
 
 interface FinalTranscriptPayload {
   fullText?: string;
   deltaText: string;
   isFinal: boolean;
+  translations?: Record<string, TranslationEntry>;
+  detectedLanguage?: string | null;
 }
 
 const DEFAULT_WHISPER_ENDPOINT = "https://whisper.obiente.cloud/transcribe";
@@ -84,6 +88,13 @@ export const useLiveTranslation = () => {
   const conversationHistory = ref<ConversationHistoryEntry[]>([]);
   const globalStatus = ref<StatusMessage | null>(null);
   const showTranslationAlternatives = ref<boolean>(false);
+  const clampAlternativeLimit = (value: number): number =>
+    Math.max(0, Math.min(5, Number.isFinite(value) ? Math.round(value) : 0));
+  const translationAlternativesLimit = ref<number>(clampAlternativeLimit(2));
+  const resolveAlternativeLimit = (): number =>
+    clampAlternativeLimit(
+      showTranslationAlternatives.value ? translationAlternativesLimit.value : 0,
+    );
   const transcriptionMode = ref<TranscriptionMode>("streaming");
   const speechSupported = ref<boolean>(
     typeof window !== "undefined" &&
@@ -94,6 +105,71 @@ export const useLiveTranslation = () => {
   const LIVE_TRANSLATION_DEBOUNCE_MS = 450;
   const liveTranslationTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const liveTranslationRequests = new Map<string, symbol>();
+
+  const sanitizeTranslationEntry = (
+    entry: TranslationEntry | undefined | null,
+  ): TranslationEntry | null => {
+    if (!entry) {
+      return null;
+    }
+
+    let primary = typeof entry.primary === "string"
+      ? entry.primary.trim()
+      : "";
+    let alternatives = Array.isArray(entry.alternatives)
+      ? Array.from(
+        new Set(
+          entry.alternatives
+            .map((option) =>
+              typeof option === "string" ? option.trim() : "",
+            )
+            .filter((option) => option.length > 0),
+        ),
+      )
+      : [];
+
+    alternatives = alternatives.filter((option) => option !== primary);
+
+    if (!primary && alternatives.length > 0) {
+      primary = alternatives[0];
+      alternatives = alternatives.slice(1);
+    }
+
+    if (!primary && alternatives.length === 0) {
+      return null;
+    }
+
+    return { primary, alternatives };
+  };
+
+  const filterTranslationEntries = (
+    translations: Record<string, TranslationEntry> | undefined,
+    targetLanguages: string[],
+  ): Record<string, TranslationEntry> => {
+    if (!translations || typeof translations !== "object") {
+      return {};
+    }
+
+    const whitelist = new Set(
+      targetLanguages.map((code) => code.trim()).filter((code) => code.length > 0),
+    );
+    const allowAll = whitelist.size === 0;
+
+    return Object.entries(translations).reduce<Record<string, TranslationEntry>>(
+      (acc, [code, entry]) => {
+        if (!allowAll && !whitelist.has(code)) {
+          return acc;
+        }
+
+        const sanitized = sanitizeTranslationEntry(entry);
+        if (sanitized) {
+          acc[code] = sanitized;
+        }
+        return acc;
+      },
+      {},
+    );
+  };
 
   const { translateText, getSupportedLanguages } = useTranslationService();
   const {
@@ -142,7 +218,11 @@ export const useLiveTranslation = () => {
     ensureStream: resolveTranscriptionStream,
     updateStatus: setChannelStatus,
     endpoint: WHISPER_ENDPOINT,
-    onTranscription: async (channel, { text, language, fullText, isFinal }) => {
+    getTranslationAlternativeLimit: resolveAlternativeLimit,
+    onTranscription: async (
+      channel,
+      { text, language, fullText, isFinal, translations },
+    ) => {
       if (language) {
         channel.detectedLanguage = language;
       }
@@ -153,21 +233,40 @@ export const useLiveTranslation = () => {
           ? `${channel.liveTranscript} ${text}`.trim()
           : text;
       }
-        const previewText = fullText?.trim()?.length
-          ? fullText
-          : channel.liveTranscript;
+      const trimmedFullText = fullText?.trim() ?? "";
+      const primaryPreview = trimmedFullText.length > 0
+        ? trimmedFullText
+        : channel.liveTranscript;
+      const normalizedTranslations = translations ?? {};
+      const filteredServerTranslations = filterTranslationEntries(
+        normalizedTranslations,
+        channel.targetLanguages,
+      );
+      const hasServerTranslations =
+        Object.keys(filteredServerTranslations).length > 0;
 
-        if (isFinal) {
+      if (isFinal) {
+        clearLiveTranslationSchedule(channel.id);
+        channel.liveTranslations = {};
+        if (!hasServerTranslations) {
           resetLiveTranslations(channel);
-        } else if (previewText && previewText.trim().length > 0) {
-          scheduleLiveTranslation(channel, previewText);
         }
+      } else if (hasServerTranslations) {
+        clearLiveTranslationSchedule(channel.id);
+        channel.liveTranslations = filteredServerTranslations;
+      } else if (primaryPreview) {
+        scheduleLiveTranslation(channel, primaryPreview);
+      } else {
+        resetLiveTranslations(channel);
+      }
 
-        await handleFinalTranscript(channel, {
-          fullText,
-          deltaText: text,
-          isFinal: isFinal ?? true,
-        });
+      await handleFinalTranscript(channel, {
+        fullText,
+        deltaText: text,
+        isFinal: isFinal ?? true,
+        translations: filteredServerTranslations,
+        detectedLanguage: language ?? null,
+      });
     },
   });
 
@@ -175,7 +274,11 @@ export const useLiveTranslation = () => {
     ensureStream: resolveTranscriptionStream,
     updateStatus: setChannelStatus,
     endpoint: WHISPER_STREAMING_ENDPOINT,
-    onTranscription: async (channel, { text, language, fullText, isFinal }) => {
+    getTranslationAlternativeLimit: resolveAlternativeLimit,
+    onTranscription: async (
+      channel,
+      { text, language, fullText, isFinal, translations },
+    ) => {
       if (language) {
         channel.detectedLanguage = language;
       }
@@ -186,21 +289,41 @@ export const useLiveTranslation = () => {
           ? `${channel.liveTranscript} ${text}`.trim()
           : text;
       }
-        const previewText = fullText?.trim()?.length
-          ? fullText
-          : channel.liveTranscript;
 
-        if (isFinal) {
+      const trimmedFullText = fullText?.trim() ?? "";
+      const primaryPreview = trimmedFullText.length > 0
+        ? trimmedFullText
+        : channel.liveTranscript;
+      const normalizedTranslations = translations ?? {};
+      const filteredServerTranslations = filterTranslationEntries(
+        normalizedTranslations,
+        channel.targetLanguages,
+      );
+      const hasServerTranslations =
+        Object.keys(filteredServerTranslations).length > 0;
+
+      if (isFinal) {
+        clearLiveTranslationSchedule(channel.id);
+        channel.liveTranslations = {};
+        if (!hasServerTranslations) {
           resetLiveTranslations(channel);
-        } else if (previewText && previewText.trim().length > 0) {
-          scheduleLiveTranslation(channel, previewText);
         }
+      } else if (hasServerTranslations) {
+        clearLiveTranslationSchedule(channel.id);
+        channel.liveTranslations = filteredServerTranslations;
+      } else if (primaryPreview) {
+        scheduleLiveTranslation(channel, primaryPreview);
+      } else {
+        resetLiveTranslations(channel);
+      }
 
-        await handleFinalTranscript(channel, {
-          fullText,
-          deltaText: text,
-          isFinal: isFinal ?? false,
-        });
+      await handleFinalTranscript(channel, {
+        fullText,
+        deltaText: text,
+        isFinal: isFinal ?? false,
+        translations: filteredServerTranslations,
+        detectedLanguage: language ?? null,
+      });
     },
   });
 
@@ -260,33 +383,14 @@ export const useLiveTranslation = () => {
       }
     }
 
-    const whitelist = new Set(channel.targetLanguages);
-    const liveEntries = Object.keys(channel.liveTranslations);
-    const historicalEntries = Object.keys(channel.translations);
-    if (liveEntries.some((code) => !whitelist.has(code))) {
-      channel.liveTranslations = liveEntries.reduce<Record<string, string>>(
-        (acc, code) => {
-          if (whitelist.has(code)) {
-            acc[code] = channel.liveTranslations[code];
-          }
-          return acc;
-        },
-        {},
-      );
-    }
-    if (historicalEntries.some((code) => !whitelist.has(code))) {
-      channel.translations = historicalEntries.reduce<
-        Record<string, TranslationEntry>
-      >(
-        (acc, code) => {
-          if (whitelist.has(code)) {
-            acc[code] = channel.translations[code];
-          }
-          return acc;
-        },
-        {},
-      );
-    }
+    channel.liveTranslations = filterTranslationEntries(
+      channel.liveTranslations,
+      channel.targetLanguages,
+    );
+    channel.translations = filterTranslationEntries(
+      channel.translations,
+      channel.targetLanguages,
+    );
   };
 
   const clearLiveTranslationSchedule = (channelId: string): void => {
@@ -317,6 +421,8 @@ export const useLiveTranslation = () => {
       return;
     }
 
+    const alternativeLimit = resolveAlternativeLimit();
+
     const existingTimer = liveTranslationTimers.get(channelId);
     if (existingTimer !== undefined) {
       clearTimeout(existingTimer);
@@ -344,10 +450,16 @@ export const useLiveTranslation = () => {
                   ? "auto"
                   : channel.sourceLanguage,
                 target,
+                alternativeLimit,
               );
               return {
                 target,
-                primary: result.translatedText.trim(),
+                entry: sanitizeTranslationEntry({
+                  primary: result.translatedText,
+                  alternatives: Array.isArray(result.alternatives)
+                    ? result.alternatives
+                    : [],
+                }),
               };
             }),
           );
@@ -356,15 +468,25 @@ export const useLiveTranslation = () => {
             return;
           }
 
-          const liveUpdates: Record<string, string> = {};
-          translationResults.forEach(({ target, primary }) => {
-            liveUpdates[target] = primary;
+          const liveUpdates: Record<string, TranslationEntry> = {};
+          translationResults.forEach(({ target, entry }) => {
+            if (entry) {
+              liveUpdates[target] = entry;
+            }
           });
 
-          channel.liveTranslations = {
-            ...channel.liveTranslations,
-            ...liveUpdates,
-          };
+          if (Object.keys(liveUpdates).length === 0) {
+            resetLiveTranslations(channel);
+            return;
+          }
+
+          channel.liveTranslations = filterTranslationEntries(
+            {
+              ...channel.liveTranslations,
+              ...liveUpdates,
+            },
+            channel.targetLanguages,
+          );
         } catch (error) {
           console.warn("Live translation update failed", error);
         } finally {
@@ -400,45 +522,6 @@ export const useLiveTranslation = () => {
       microphoneDeviceId: channel.microphoneDeviceId ?? null,
       microphoneDeviceLabel: channel.microphoneDeviceLabel ?? null,
     }));
-
-  const normalizeTranslationMap = (
-    input: unknown,
-  ): Record<string, TranslationEntry> => {
-    if (!input || typeof input !== "object") {
-      return {};
-    }
-
-    const entries = Object.entries(input as Record<string, unknown>);
-    return entries.reduce<Record<string, TranslationEntry>>(
-      (acc, [code, value]) => {
-        if (typeof value === "string") {
-          acc[code] = { primary: value, alternatives: [] };
-          return acc;
-        }
-
-        if (value && typeof value === "object") {
-          const primary =
-            typeof (value as { primary?: unknown }).primary === "string"
-              ? (value as { primary?: unknown }).primary as string
-              : "";
-          const alternativesSource =
-            (value as { alternatives?: unknown }).alternatives;
-          const alternatives = Array.isArray(alternativesSource)
-            ? alternativesSource.filter((item): item is string =>
-              typeof item === "string"
-            )
-            : [];
-
-          if (primary || alternatives.length > 0) {
-            acc[code] = { primary, alternatives };
-          }
-        }
-
-        return acc;
-      },
-      {},
-    );
-  };
 
   const persistChannels = (): void => {
     if (typeof window === "undefined") {
@@ -484,6 +567,28 @@ export const useLiveTranslation = () => {
         "Failed to persist translation alternative preference",
         error,
       );
+    }
+  };
+
+  const persistAlternativeLimit = (): void => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    try {
+      const sanitized = clampAlternativeLimit(
+        translationAlternativesLimit.value,
+      );
+      if (sanitized !== translationAlternativesLimit.value) {
+        translationAlternativesLimit.value = sanitized;
+        return;
+      }
+      localStorage.setItem(
+        TRANSLATION_ALTERNATIVE_LIMIT_KEY,
+        String(sanitized),
+      );
+    } catch (error) {
+      console.warn("Failed to persist translation alternative limit", error);
     }
   };
 
@@ -533,6 +638,26 @@ export const useLiveTranslation = () => {
         "Failed to restore translation alternative preference",
         error,
       );
+    }
+  };
+
+  const restoreAlternativeLimit = (): void => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    try {
+      const raw = localStorage.getItem(TRANSLATION_ALTERNATIVE_LIMIT_KEY);
+      if (raw === null) {
+        return;
+      }
+
+      const parsed = Number.parseInt(raw, 10);
+      translationAlternativesLimit.value = clampAlternativeLimit(
+        Number.isFinite(parsed) ? parsed : 0,
+      );
+    } catch (error) {
+      console.warn("Failed to restore translation alternative limit", error);
     }
   };
 
@@ -772,31 +897,73 @@ export const useLiveTranslation = () => {
 
     ensureTargets(channel);
     channel.lastFinalTranscript = fullUtterance || effectiveUtterance;
+
+    const filteredServerTranslations = filterTranslationEntries(
+      payload.translations,
+      channel.targetLanguages,
+    );
+
+    if (Object.keys(filteredServerTranslations).length > 0) {
+      channel.translations = {
+        ...channel.translations,
+        ...filteredServerTranslations,
+      };
+      channel.detectedLanguage =
+        payload.detectedLanguage ?? channel.detectedLanguage;
+      channel.liveTranscript = "";
+      channel.isTranslating = false;
+      setChannelStatus(channel, "Translations updated", "success");
+
+      if (channel.autoSpeak) {
+        Object.entries(filteredServerTranslations)
+          .filter(([, entry]) => entry.primary.length > 0)
+          .forEach(([target, entry]) => speak(entry.primary, target));
+      }
+
+      conversationHistoryPush({
+        id: createId(),
+        channelId: channel.id,
+        channelLabel: channel.label,
+        sourceLanguage: channel.sourceLanguage,
+        detectedLanguage: channel.detectedLanguage,
+        transcript: channel.lastFinalTranscript,
+        translations: filteredServerTranslations,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (channel.targetLanguages.length === 0) {
+      channel.isTranslating = false;
+      setChannelStatus(channel, "No target languages selected", "info");
+      return;
+    }
+
     setChannelStatus(channel, "Translating…", "processing");
     channel.isTranslating = true;
 
     const translationSource = fullUtterance || deltaUtterance;
+    const alternativeLimit = resolveAlternativeLimit();
 
     try {
       const translationResults = await Promise.all(
         channel.targetLanguages.map(async (target) => {
           const result = await translateText(
             translationSource,
-            channel.sourceLanguage === "auto" ? "auto" : channel.sourceLanguage,
+            channel.sourceLanguage === "auto"
+              ? "auto"
+              : channel.sourceLanguage,
             target,
-          );
-          const primary = result.translatedText.trim();
-          const alternatives = Array.from(
-            new Set(
-              result.alternatives
-                .map((entry) => entry.trim())
-                .filter((entry) => entry.length > 0 && entry !== primary),
-            ),
+            alternativeLimit,
           );
           return {
             target,
-            primary,
-            alternatives,
+            entry: sanitizeTranslationEntry({
+              primary: result.translatedText,
+              alternatives: Array.isArray(result.alternatives)
+                ? result.alternatives
+                : [],
+            }),
             detectedLanguage: result.detectedLanguage,
           };
         }),
@@ -804,11 +971,21 @@ export const useLiveTranslation = () => {
 
       const translationMap: Record<string, TranslationEntry> = {};
       translationResults.forEach((entry) => {
-        translationMap[entry.target] = {
-          primary: entry.primary,
-          alternatives: [...entry.alternatives],
-        };
+        if (entry.entry) {
+          translationMap[entry.target] = entry.entry;
+        }
       });
+
+      if (Object.keys(translationMap).length === 0) {
+        setChannelStatus(
+          channel,
+          "No translations were generated for the latest speech segment.",
+          "info",
+        );
+        channel.liveTranscript = "";
+        channel.isTranslating = false;
+        return;
+      }
 
       channel.translations = {
         ...channel.translations,
@@ -822,9 +999,9 @@ export const useLiveTranslation = () => {
       channel.liveTranscript = "";
 
       if (channel.autoSpeak) {
-        translationResults
-          .filter((entry) => entry.primary)
-          .forEach((entry) => speak(entry.primary, entry.target));
+        Object.entries(translationMap)
+          .filter(([, entry]) => entry.primary.length > 0)
+          .forEach(([target, entry]) => speak(entry.primary, target));
       }
 
       conversationHistoryPush({
@@ -972,6 +1149,15 @@ export const useLiveTranslation = () => {
     persistAlternativePreference();
   });
 
+  watch(translationAlternativesLimit, (value) => {
+    const clamped = clampAlternativeLimit(value);
+    if (clamped !== value) {
+      translationAlternativesLimit.value = clamped;
+      return;
+    }
+    persistAlternativeLimit();
+  });
+
   watch(
     transcriptionMode,
     (newMode, oldMode) => {
@@ -993,6 +1179,7 @@ export const useLiveTranslation = () => {
   onMounted(async () => {
     restoreHistory();
     restoreAlternativePreference();
+    restoreAlternativeLimit();
     restoreTranscriptionMode();
 
     const restoredFromStorage = restoreChannels();
@@ -1020,6 +1207,7 @@ export const useLiveTranslation = () => {
     persistChannels();
     persistSelectedChannel();
     persistAlternativePreference();
+    persistAlternativeLimit();
     persistTranscriptionMode();
 
     if (typeof navigator !== "undefined" && navigator.mediaDevices) {
@@ -1066,6 +1254,7 @@ export const useLiveTranslation = () => {
     recentHistory,
     globalStatus,
     showTranslationAlternatives,
+    translationAlternativesLimit,
     transcriptionMode,
     speechSupported,
     desktopCaptureSupported,

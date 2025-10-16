@@ -1,7 +1,12 @@
-import type { ConversationChannel, StatusType } from "../../types/conversation";
+import type {
+    ConversationChannel,
+    StatusType,
+    TranslationEntry,
+} from "../../types/conversation";
 import type { WhisperTranscriberManager } from "./useWhisperTranscriber";
-const DEFAULT_CHUNK_INTERVAL_MS = 750;  // Mirror original tuning; focus on logical fixes rather than extreme chunking
-const DEFAULT_KEEPALIVE_INTERVAL_MS = 15000;
+import { normalizeTranslationMap } from "../../utils/translation";
+const DEFAULT_CHUNK_INTERVAL_MS = 125;
+const DEFAULT_KEEPALIVE_INTERVAL_MS = 5000;
 const DEFAULT_KEEPALIVE_TIMEOUT_MS = 45000;
 const RECONNECT_BASE_DELAY_MS = 500;
 const RECONNECT_MAX_DELAY_MS = 15000;
@@ -14,6 +19,7 @@ interface TranscriptionResult {
     fullText?: string;
     isFinal?: boolean;
     sequence?: number;
+    translations?: Record<string, TranslationEntry>;
 }
 
 interface UseStreamingWhisperTranscriberOptions {
@@ -29,6 +35,7 @@ interface UseStreamingWhisperTranscriberOptions {
     ) => void;
     endpoint: string;
     chunkIntervalMs?: number;
+    getTranslationAlternativeLimit?: () => number;
 }
 
 interface StreamingState {
@@ -143,6 +150,18 @@ const resolvePayloadText = (value: unknown): string =>
 const resolvePayloadNumber = (value: unknown): number | undefined =>
     typeof value === "number" && Number.isFinite(value) ? value : undefined;
 
+const resolveTargetLanguages = (targets: string[]): string[] =>
+    Array.from(
+        new Set(
+            targets
+                .map((code) => (typeof code === "string" ? code.trim() : ""))
+                .filter((code) => code.length > 0),
+        ),
+    );
+
+const clampAlternativeLimit = (value: number): number =>
+    Math.max(0, Math.min(5, Number.isFinite(value) ? Math.trunc(value) : 0));
+
 export const useStreamingWhisperTranscriber = (
     options: UseStreamingWhisperTranscriberOptions,
 ): WhisperTranscriberManager => {
@@ -152,6 +171,7 @@ export const useStreamingWhisperTranscriber = (
         updateStatus,
         endpoint,
         chunkIntervalMs = DEFAULT_CHUNK_INTERVAL_MS,
+        getTranslationAlternativeLimit,
     } = options;
 
     const states = new Map<string, StreamingState>();
@@ -223,7 +243,7 @@ export const useStreamingWhisperTranscriber = (
         }
 
         const delay = Math.min(
-            RECONNECT_BASE_DELAY_MS * 2 ** state.reconnectAttempts,
+            RECONNECT_BASE_DELAY_MS * 0.5 ** state.reconnectAttempts,
             RECONNECT_MAX_DELAY_MS,
         );
 
@@ -248,7 +268,9 @@ export const useStreamingWhisperTranscriber = (
 
             const now = Date.now();
             if (now - state.lastKeepaliveAt >= DEFAULT_KEEPALIVE_TIMEOUT_MS) {
-                console.warn("Streaming keepalive timed out; forcing reconnect");
+                console.warn(
+                    "Streaming keepalive timed out; forcing reconnect",
+                );
                 try {
                     socket.close();
                 } catch (error) {
@@ -269,7 +291,7 @@ export const useStreamingWhisperTranscriber = (
         try {
             const audioContext = new AudioContext();
             const source = audioContext.createMediaStreamSource(stream);
-            const processor = audioContext.createScriptProcessor(4096, 1, 1);  // Original buffer size for stable capture
+            const processor = audioContext.createScriptProcessor(4096, 1, 1); // Original buffer size for stable capture
 
             state.audioContext = audioContext;
             state.processor = processor;
@@ -306,8 +328,7 @@ export const useStreamingWhisperTranscriber = (
         state: StreamingState,
         isFinal: boolean,
     ): void => {
-        const socketOpen =
-            !!state.websocket &&
+        const socketOpen = !!state.websocket &&
             state.websocket.readyState === WebSocket.OPEN;
 
         if (!socketOpen && !isFinal) {
@@ -375,14 +396,28 @@ export const useStreamingWhisperTranscriber = (
 
         const base64 = await blobToBase64(blob);
 
-        sendJson(socket, {
+        const targets = resolveTargetLanguages(state.channel.targetLanguages);
+        const alternativeLimit = clampAlternativeLimit(
+            getTranslationAlternativeLimit
+                ? getTranslationAlternativeLimit()
+                : 0,
+        );
+        const payload: Record<string, unknown> = {
             type: "chunk",
             sequence: state.sequence,
             data: base64,
             mime_type: "audio/wav",
             sample_rate: state.sampleRate,
             is_final: isFinal,
-        });
+        };
+        if (targets.length > 0) {
+            payload.target_languages = targets;
+        }
+        if (alternativeLimit > 0) {
+            payload.translation_alternatives = alternativeLimit;
+        }
+
+        sendJson(socket, payload);
 
         state.sequence += 1;
 
@@ -451,6 +486,7 @@ export const useStreamingWhisperTranscriber = (
         const language = resolvePayloadText(payload.language) || undefined;
         const isFinal = Boolean(payload.isFinal);
         const sequence = resolvePayloadNumber(payload.sequence);
+        const translations = normalizeTranslationMap(payload.translations);
 
         try {
             await onTranscription(state.channel, {
@@ -459,6 +495,7 @@ export const useStreamingWhisperTranscriber = (
                 language,
                 isFinal,
                 sequence,
+                translations,
             });
         } catch (error) {
             console.error("Streaming transcription callback failed", error);
@@ -486,7 +523,11 @@ export const useStreamingWhisperTranscriber = (
             }
 
             state.websocket = null;
-            updateStatus(state.channel, "Streaming connection lost. Reconnecting…", "processing");
+            updateStatus(
+                state.channel,
+                "Streaming connection lost. Reconnecting…",
+                "processing",
+            );
             scheduleReconnect(state);
         });
 
@@ -544,8 +585,25 @@ export const useStreamingWhisperTranscriber = (
             channel_id: state.channel.id,
         };
 
-        if (state.channel.sourceLanguage && state.channel.sourceLanguage !== "auto") {
+        if (
+            state.channel.sourceLanguage &&
+            state.channel.sourceLanguage !== "auto"
+        ) {
             payload.language = state.channel.sourceLanguage;
+        }
+
+        const targets = resolveTargetLanguages(state.channel.targetLanguages);
+        if (targets.length > 0) {
+            payload.target_languages = targets;
+        }
+
+        const alternativeLimit = clampAlternativeLimit(
+            getTranslationAlternativeLimit
+                ? getTranslationAlternativeLimit()
+                : 0,
+        );
+        if (alternativeLimit > 0) {
+            payload.translation_alternatives = alternativeLimit;
         }
 
         sendJson(websocket, payload);
@@ -609,7 +667,10 @@ export const useStreamingWhisperTranscriber = (
         try {
             await connectWebSocket(state);
         } catch (error) {
-            console.error("Initial streaming websocket connection failed", error);
+            console.error(
+                "Initial streaming websocket connection failed",
+                error,
+            );
             scheduleReconnect(state);
             throw error;
         }

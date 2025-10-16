@@ -34,7 +34,17 @@ const DEFAULT_LIBRE_BASE = 'https://libretranslate.obiente.cloud'
 const DEFAULT_ALTERNATIVES = 3
 
 const libreBase = (import.meta.env.VITE_LIBRE_TRANSLATE_BASE as string | undefined)?.trim() || DEFAULT_LIBRE_BASE
-const alternativesRequested = Number((import.meta.env.VITE_LIBRE_TRANSLATE_ALTERNATIVES as string | undefined) ?? DEFAULT_ALTERNATIVES)
+const rawAlternativesRequested = Number((import.meta.env.VITE_LIBRE_TRANSLATE_ALTERNATIVES as string | undefined) ?? DEFAULT_ALTERNATIVES)
+
+const clampAlternativeLimit = (value: number | undefined): number => {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return 0
+  }
+
+  return Math.max(0, Math.min(5, Math.trunc(value)))
+}
+
+const defaultAlternativesRequested = clampAlternativeLimit(rawAlternativesRequested)
 
 const libreClient = axios.create({
   baseURL: libreBase,
@@ -65,7 +75,8 @@ export function useTranslationService() {
   const translateText = async (
     text: string,
     sourceLanguage: LanguageCode = 'auto',
-    targetLanguage: LanguageCode = 'en'
+    targetLanguage: LanguageCode = 'en',
+    alternativeLimit?: number
   ): Promise<TranslationResult> => {
     if (!text.trim()) {
       const defaultLang = sourceLanguage === 'auto' ? null : sourceLanguage
@@ -85,8 +96,12 @@ export function useTranslationService() {
         format: 'text'
       }
 
-      if (Number.isFinite(alternativesRequested) && alternativesRequested > 0) {
-        payload.alternatives = Math.min(Math.max(Math.trunc(alternativesRequested), 1), 10)
+      const requestedFromParam = clampAlternativeLimit(alternativeLimit)
+      const fallbackAlternatives = defaultAlternativesRequested
+      const effectiveAlternatives = requestedFromParam > 0 ? requestedFromParam : fallbackAlternatives
+
+      if (effectiveAlternatives > 0) {
+        payload.alternatives = effectiveAlternatives
       }
 
       const response = await libreClient.post<LibreTranslateResponse>('/translate', payload)

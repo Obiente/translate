@@ -1,4 +1,9 @@
-import type { ConversationChannel, StatusType } from "../../types/conversation";
+import type {
+    ConversationChannel,
+    StatusType,
+    TranslationEntry,
+} from "../../types/conversation";
+import { normalizeTranslationMap } from "../../utils/translation";
 
 interface TranscriptionResult {
     text: string;
@@ -6,6 +11,7 @@ interface TranscriptionResult {
     fullText?: string;
     isFinal?: boolean;
     sequence?: number;
+    translations?: Record<string, TranslationEntry>;
 }
 
 interface UseWhisperTranscriberOptions {
@@ -21,6 +27,7 @@ interface UseWhisperTranscriberOptions {
     ) => void;
     endpoint: string;
     chunkIntervalMs?: number;
+    getTranslationAlternativeLimit?: () => number;
 }
 
 interface RecorderEntry {
@@ -46,6 +53,15 @@ const resolveMimeType = (): string | undefined => {
     return preferred.find((type) => MediaRecorder.isTypeSupported(type));
 };
 
+const resolveTargetLanguages = (targets: string[]): string[] =>
+    Array.from(
+        new Set(
+            targets
+                .map((code) => (typeof code === "string" ? code.trim() : ""))
+                .filter((code) => code.length > 0),
+        ),
+    );
+
 export interface WhisperTranscriberManager {
     start: (channel: ConversationChannel) => Promise<void>;
     stop: (channelId: string) => Promise<void>;
@@ -62,6 +78,7 @@ export const useWhisperTranscriber = (
         updateStatus,
         endpoint,
         chunkIntervalMs = 5000,
+        getTranslationAlternativeLimit,
     } = options;
 
     const recorders = new Map<string, RecorderEntry>();
@@ -103,6 +120,32 @@ export const useWhisperTranscriber = (
                     ) {
                         formData.append("language", channel.sourceLanguage);
                     }
+                    const sanitizedTargets = resolveTargetLanguages(
+                        channel.targetLanguages,
+                    );
+                    if (sanitizedTargets.length > 0) {
+                        formData.append(
+                            "target_languages",
+                            JSON.stringify(sanitizedTargets),
+                        );
+                    }
+                    const alternativeLimit = Math.max(
+                        0,
+                        Math.min(
+                            5,
+                            Math.trunc(
+                                getTranslationAlternativeLimit
+                                    ? getTranslationAlternativeLimit()
+                                    : 0,
+                            ),
+                        ),
+                    );
+                    if (alternativeLimit > 0) {
+                        formData.append(
+                            "translation_alternatives",
+                            String(alternativeLimit),
+                        );
+                    }
                     formData.append("file", blob, filename);
 
                     const response = await fetch(endpoint, {
@@ -122,9 +165,13 @@ export const useWhisperTranscriber = (
                     const payload = (await response.json()) as {
                         text?: string;
                         language?: string;
+                        translations?: unknown;
                     };
                     const fullText = (payload.text ?? "").trim();
                     const language = payload.language;
+                    const translations = normalizeTranslationMap(
+                        payload.translations,
+                    );
 
                     if (fullText.length === 0) {
                         updateStatus(channel, "Listening…", "listening");
@@ -184,6 +231,7 @@ export const useWhisperTranscriber = (
                             language,
                             isFinal: true,
                             sequence: nextSequence,
+                            translations,
                         });
                         updateStatus(channel, "Listening…", "listening");
                     } else {
