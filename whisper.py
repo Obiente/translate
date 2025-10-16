@@ -1,16 +1,19 @@
 from collections import deque
 from io import BytesIO
+import asyncio
 import base64
 import binascii
+import json
 import logging
 import mimetypes
 import os
 import time
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Iterable, List
 from uuid import uuid4
 
 import ffmpeg
+import httpx
 from fastapi import (
     FastAPI,
     File,
@@ -28,7 +31,7 @@ logging.basicConfig(level=logging.INFO)
 
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "turbo")  # Optimized for CPU streaming
 try:
-    WHISPER_BATCH_SIZE = max(int(os.getenv("WHISPER_BATCH_SIZE", "6")), 1)
+    WHISPER_BATCH_SIZE = max(int(os.getenv("WHISPER_BATCH_SIZE", "8")), 1)
 except ValueError:
     WHISPER_BATCH_SIZE = 1
 
@@ -44,17 +47,27 @@ batched_pipeline = (
     BatchedInferencePipeline(model=model) if WHISPER_BATCH_SIZE > 1 else None
 )
 
+
+@app.on_event("shutdown")
+async def _close_clients() -> None:
+    global translation_client
+    if translation_client is not None:
+        try:
+            await translation_client.aclose()
+        finally:
+            translation_client = None
+
 MP4_INITIALIZATION_SEGMENTS: Dict[str, bytes] = {}
 STREAMING_INITIAL_SEGMENTS: Dict[str, bytes] = {}
 # Streaming configuration
 MAX_STREAM_BUFFER_SIZE = 32 * 1024 * 1024  # 32 MiB buffer limit (reduced for efficiency)
-STREAMING_WINDOW_SECONDS = 6.0  # Legacy value; buffer trimming now size-based only
+STREAMING_WINDOW_SECONDS = 12.0  # Legacy value; buffer trimming now size-based only
 MIN_CHUNK_SIZE = 4096  # ~0.125s at 16kHz (very small for frequent intermediate updates)
 AUTO_FINAL_SILENCE_THRESHOLD = 0.05  # Shorter silence threshold due to turbo's accuracy
 AUTO_FINAL_REPEAT_THRESHOLD = 2  # Reasonable finalization threshold
     
 # Transcription throttling - minimum interval between transcriptions
-MIN_TRANSCRIPTION_INTERVAL = 0.1  # 100ms balance between responsiveness and stability
+MIN_TRANSCRIPTION_INTERVAL = 0.5  # 100ms balance between responsiveness and stability
 
 # Audio parameters for buffer management
 DEFAULT_SAMPLE_RATE = 16000  # Default 16kHz sample rate (for estimation)
@@ -113,13 +126,270 @@ def _env_int(name: str, default: int) -> int:
 
 
 ENABLE_VAD_FILTER = _env_flag("WHISPER_VAD_FILTER", "true")
-VAD_MIN_SILENCE_DURATION_MS = _env_int("WHISPER_VAD_MIN_SILENCE_MS", 500)
+VAD_MIN_SILENCE_DURATION_MS = _env_int("WHISPER_VAD_MIN_SILENCE_MS", 250)
 
 VAD_PARAMETERS = (
     {"min_silence_duration_ms": VAD_MIN_SILENCE_DURATION_MS}
     if ENABLE_VAD_FILTER
     else None
 )
+
+TRANSLATION_BASE_URL = os.getenv("TRANSLATION_BASE_URL", "http://127.0.0.1:5000")
+_RAW_TRANSLATION_ALTERNATIVES = _env_int("TRANSLATION_ALTERNATIVES_MAX", -1)
+if _RAW_TRANSLATION_ALTERNATIVES < 0:
+    _RAW_TRANSLATION_ALTERNATIVES = _env_int("TRANSLATION_ALTERNATIVES", 5)
+TRANSLATION_ALTERNATIVES_MAX = min(max(_RAW_TRANSLATION_ALTERNATIVES, 0), 5)
+TRANSLATION_TIMEOUT = float(os.getenv("TRANSLATION_TIMEOUT", "8"))
+TRANSLATION_ENABLED = _env_flag("WHISPER_SERVER_TRANSLATIONS", "true")
+
+translation_client: httpx.AsyncClient | None = None
+translation_client_lock = asyncio.Lock()
+
+DEFAULT_SUPPRESS_TOKEN_STRINGS: list[str] = [
+    "<|nospeech|>",
+    "<|silence|>",
+    "<|laugh|>",
+    "<|music|>",
+    "<|applause|>",
+    "[silence]",
+    "[noise]",
+    "[music]",
+    "♪",
+]
+
+_ENV_SUPPRESS_TOKENS = os.getenv("WHISPER_SUPPRESS_TOKENS")
+if _ENV_SUPPRESS_TOKENS:
+    DEFAULT_SUPPRESS_TOKEN_STRINGS.extend(
+        token.strip()
+        for token in _ENV_SUPPRESS_TOKENS.split(",")
+        if token and token.strip()
+    )
+
+_SUPPRESS_TOKEN_IDS: list[int] | None = None
+
+
+def _compute_suppress_token_ids() -> list[int]:
+    global _SUPPRESS_TOKEN_IDS
+    if _SUPPRESS_TOKEN_IDS is not None:
+        return _SUPPRESS_TOKEN_IDS
+
+    suppressed: set[int] = {-1}
+    tokenizer = getattr(model, "tokenizer", None)
+    if tokenizer is None:
+        logger.warning("Whisper tokenizer unavailable; using default suppress token -1 only")
+        _SUPPRESS_TOKEN_IDS = sorted(suppressed)
+        return _SUPPRESS_TOKEN_IDS
+
+    special_tokens: Dict[str, int] = getattr(tokenizer, "special_tokens", {}) or {}
+
+    for token_string in DEFAULT_SUPPRESS_TOKEN_STRINGS:
+        entry = token_string.strip()
+        if not entry:
+            continue
+
+        if entry in special_tokens:
+            token_id = special_tokens[entry]
+            if isinstance(token_id, int):
+                suppressed.add(int(token_id))
+            continue
+
+        encoded_tokens: list[int] = []
+        try:
+            encoded_tokens = tokenizer.encode(entry, add_special_tokens=True)
+        except TypeError:
+            # Older faster-whisper versions may not accept add_special_tokens
+            try:
+                encoded_tokens = tokenizer.encode(entry)
+            except Exception as encode_error:  # pragma: no cover - defensive guard
+                logger.debug(
+                    "Failed to encode suppress token '%s': %s",
+                    entry,
+                    encode_error,
+                )
+                continue
+        except Exception as encode_error:  # pragma: no cover - defensive guard
+            logger.debug(
+                "Failed to encode suppress token '%s': %s",
+                entry,
+                encode_error,
+            )
+            continue
+
+        for token_id in encoded_tokens:
+            if isinstance(token_id, int):
+                suppressed.add(int(token_id))
+
+    _SUPPRESS_TOKEN_IDS = sorted(suppressed)
+    logger.info("Suppressing %d tokens to limit hallucinations", len(_SUPPRESS_TOKEN_IDS))
+    return _SUPPRESS_TOKEN_IDS
+
+
+async def _get_translation_client() -> httpx.AsyncClient:
+    global translation_client
+    if translation_client is not None:
+        return translation_client
+
+    async with translation_client_lock:
+        if translation_client is None:
+            translation_client = httpx.AsyncClient(
+                base_url=TRANSLATION_BASE_URL,
+                timeout=TRANSLATION_TIMEOUT,
+                headers={"Content-Type": "application/json"},
+            )
+    return translation_client
+
+
+async def _translate_transcript(
+    text: str,
+    source_language: str | None,
+    targets: Iterable[str] | None,
+    alternative_limit: int = 0,
+) -> tuple[Dict[str, Dict[str, object]], str | None]:
+    if not TRANSLATION_ENABLED:
+        return {}, None
+
+    unique_targets: List[str] = []
+    seen = set()
+    for raw in targets or []:
+        if not raw:
+            continue
+        code = str(raw).strip()
+        if code and code not in seen:
+            unique_targets.append(code)
+            seen.add(code)
+
+    trimmed = text.strip()
+    if not unique_targets or not trimmed:
+        return {}, None
+
+    requested_alternatives = _coerce_alternative_limit(alternative_limit)
+
+    client = await _get_translation_client()
+    source = (source_language or "auto") or "auto"
+
+    def _normalize_alternative(entry: object) -> str | None:
+        if isinstance(entry, str):
+            candidate = entry.strip()
+            return candidate or None
+
+        if isinstance(entry, dict):
+            for key in ("translatedText", "translation", "text", "value"):
+                value = entry.get(key)
+                if isinstance(value, str):
+                    candidate = value.strip()
+                    if candidate:
+                        return candidate
+
+        return None
+
+    async def request_translation(target: str):
+        payload: Dict[str, object] = {
+            "q": trimmed,
+            "source": source,
+            "target": target,
+            "format": "text",
+        }
+        if requested_alternatives > 0:
+            payload["alternatives"] = requested_alternatives
+
+        try:
+            response = await client.post("/translate", json=payload)
+            response.raise_for_status()
+            data = response.json()
+            translated = str(data.get("translatedText", "")).strip()
+            raw_alternatives = data.get("alternatives")
+            alternatives: List[str] = []
+            if isinstance(raw_alternatives, list):
+                for item in raw_alternatives:
+                    normalized = _normalize_alternative(item)
+                    if normalized and normalized not in alternatives:
+                        alternatives.append(normalized)
+            detected_lang = data.get("detectedLanguage")
+            return target, translated, alternatives, detected_lang
+        except Exception as exc:  # pragma: no cover - network best-effort safeguard
+            logger.warning(
+                "Translation request failed for %s: %s",
+                target,
+                exc,
+            )
+            return target, "", [], None
+
+    translations: Dict[str, Dict[str, object]] = {}
+    detected_language: str | None = None
+
+    responses = await asyncio.gather(
+        *(request_translation(target) for target in unique_targets),
+        return_exceptions=False,
+    )
+
+    for target, primary, alternatives, detected in responses:
+        translations[target] = {
+            "primary": primary,
+            "alternatives": alternatives,
+        }
+        if isinstance(detected, str) and not detected_language:
+            detected_language = detected
+
+    return translations, detected_language
+
+
+def _parse_target_languages(value: object) -> List[str]:
+    if value is None:
+        return []
+
+    candidates: List[str] = []
+
+    if isinstance(value, list):
+        candidates = [str(item) for item in value]
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, list):
+                candidates = [str(item) for item in parsed]
+            else:
+                candidates = [stripped]
+        except json.JSONDecodeError:
+            candidates = [part.strip() for part in stripped.split(",")]
+    else:
+        candidates = [str(value)]
+
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        entry = str(candidate).strip()
+        if entry and entry not in seen:
+            normalized.append(entry)
+            seen.add(entry)
+
+    return normalized
+
+
+def _coerce_alternative_limit(raw_value: object) -> int:
+    if raw_value is None:
+        return 0
+
+    numeric = 0
+
+    if isinstance(raw_value, (int, float)):
+        numeric = int(raw_value)
+    elif isinstance(raw_value, str):
+        stripped = raw_value.strip()
+        if not stripped:
+            return 0
+        try:
+            numeric = int(float(stripped))
+        except ValueError:
+            return 0
+    else:
+        return 0
+
+    if numeric <= 0:
+        return 0
+
+    return min(numeric, TRANSLATION_ALTERNATIVES_MAX)
 
 
 class TranscriptionError(Exception):
@@ -216,7 +486,9 @@ async def _transcribe_audio_blob(
     enable_vad: bool = True,
     is_streaming: bool = False,
     sample_rate: int | None = None,
-) -> tuple[str, str | None]:
+    target_languages: Iterable[str] | None = None,
+    translation_alternative_limit: int = 0,
+) -> tuple[str, str | None, Dict[str, Dict[str, object]]]:
     if not audio_bytes:
         raise TranscriptionError("Empty audio buffer.")
 
@@ -283,6 +555,8 @@ async def _transcribe_audio_blob(
             "temperature": 0.0,  # Lower temperature for more deterministic output
             "patience": 1.8,  # Higher patience since turbo is fast enough to handle it
             "repetition_penalty": 1.02,  # Very light penalty - turbo is less repetitive
+            "suppress_blank": True,
+            "suppress_tokens": _compute_suppress_token_ids(),
         }
         if ENABLE_VAD_FILTER and enable_vad:
             kwargs["vad_filter"] = True
@@ -299,8 +573,23 @@ async def _transcribe_audio_blob(
 
     segments, info = await run_in_threadpool(do_transcribe)
     transcript = " ".join(segment.text for segment in segments).strip()
+    whisper_detected_language = getattr(info, "language", None)
 
-    return transcript, getattr(info, "language", None)
+    translations: Dict[str, Dict[str, object]] = {}
+    translation_detected_language: str | None = None
+
+    if target_languages:
+        alt_limit = _coerce_alternative_limit(translation_alternative_limit)
+        translations, translation_detected_language = await _translate_transcript(
+            transcript,
+            whisper_detected_language or language_hint or None,
+            target_languages,
+            alt_limit,
+        )
+
+    detected_language = translation_detected_language or whisper_detected_language
+
+    return transcript, detected_language, translations
 
 
 def _maybe_dump_raw(audio_bytes: bytes, content_type: str | None) -> Path | None:
@@ -413,22 +702,48 @@ def _is_webm_initialization_chunk(data: bytes) -> bool:
 async def transcribe_audio(
     channel_id: str | None = Form(None),
     language: str | None = Form(None),
+    targets: str | None = Form(None),
+    target_languages: str | None = Form(None),
+    translation_alternatives: str | None = Form(None),
     file: UploadFile = File(...),
 ):
     audio_bytes = await file.read()
     language_hint = _normalize_language_hint(language)
 
+    combined_targets: List[str] = []
+    for raw in (targets, target_languages):
+        if raw is None:
+            continue
+        combined_targets.extend(_parse_target_languages(raw))
+    if combined_targets:
+        # Deduplicate while preserving order
+        deduped_targets: List[str] = []
+        seen_targets: set[str] = set()
+        for entry in combined_targets:
+            if entry not in seen_targets:
+                deduped_targets.append(entry)
+                seen_targets.add(entry)
+        combined_targets = deduped_targets
+
+    alternative_limit = _coerce_alternative_limit(translation_alternatives)
+
     try:
-        transcript, detected_language = await _transcribe_audio_blob(
+        transcript, detected_language, translations = await _transcribe_audio_blob(
             audio_bytes,
             file.content_type,
             channel_id,
             language_hint,
+            target_languages=combined_targets,
+            translation_alternative_limit=alternative_limit,
         )
     except TranscriptionError as exc:
         raise HTTPException(status_code=400, detail=exc.detail) from exc
 
-    return {"text": transcript, "language": detected_language}
+    return {
+        "text": transcript,
+        "language": detected_language,
+        "translations": translations,
+    }
 
 
 @app.websocket("/ws/transcribe")
@@ -440,6 +755,8 @@ async def websocket_transcribe(websocket: WebSocket):
     language_hint = ""
     mime_type: str | None = None
     session_sample_rate: int | None = None  # Track sample rate for dynamic window calculations
+    session_target_languages: List[str] = []
+    session_alternative_limit = 0
     
     # Audio buffer management - sliding window
     audio_chunks = deque()  # Store (timestamp, raw_bytes) tuples
@@ -450,6 +767,7 @@ async def websocket_transcribe(websocket: WebSocket):
     # Transcription state
     last_full_transcript = ""
     current_transcript = ""
+    current_translations: Dict[str, Dict[str, object]] = {}
     detected_language: str | None = None
     last_sequence_processed = -1
     last_transcription_time = 0.0
@@ -514,16 +832,17 @@ async def websocket_transcribe(websocket: WebSocket):
     
     def reset_session(clear_headers: bool = True) -> None:
         nonlocal audio_chunks, total_audio_bytes, chunk_counter
-        nonlocal last_full_transcript, current_transcript, detected_language
+        nonlocal last_full_transcript, current_transcript, current_translations, detected_language
         nonlocal last_sequence_processed, last_transcription_time, consecutive_errors
         nonlocal repeated_transcript_count, last_repeated_transcript, session_sample_rate
-        nonlocal is_wav_stream
+        nonlocal is_wav_stream, session_alternative_limit
         
         audio_chunks.clear()
         total_audio_bytes = 0
         chunk_counter = 0
         last_full_transcript = ""
         current_transcript = ""
+        current_translations = {}
         detected_language = None
         last_sequence_processed = -1
         last_transcription_time = 0.0
@@ -532,6 +851,7 @@ async def websocket_transcribe(websocket: WebSocket):
         last_repeated_transcript = ""
         session_sample_rate = None
         is_wav_stream = False
+        session_alternative_limit = 0
         
         if clear_headers and channel_id:
             STREAMING_INITIAL_SEGMENTS.pop(channel_id, None)
@@ -548,6 +868,18 @@ async def websocket_transcribe(websocket: WebSocket):
                 continue
 
             message_type = (message.get("type") or "").lower()
+
+            if message_type == "ping":
+                await websocket.send_json({
+                    "type": "pong",
+                    "ts": message.get("ts"),
+                    "channel_id": channel_id,
+                })
+                continue
+
+            if message_type == "pong":
+                # Ignore client pong responses (useful if server ever initiates keepalive)
+                continue
 
             if message_type == "start":
                 print(f"DEBUG: Received start message: {message}")
@@ -573,6 +905,19 @@ async def websocket_transcribe(websocket: WebSocket):
                 
                 channel_id = new_channel_id
                 language_hint = _normalize_language_hint(message.get("language"))
+                session_target_languages = _parse_target_languages(
+                    message.get("target_languages")
+                    if "target_languages" in message
+                    else message.get("targets")
+                )
+                raw_alternative_limit = (
+                    message.get("translation_alternatives")
+                    if "translation_alternatives" in message
+                    else message.get("alternatives")
+                )
+                session_alternative_limit = _coerce_alternative_limit(
+                    raw_alternative_limit
+                )
                 
                 await websocket.send_json({
                     "type": "session_started",
@@ -611,7 +956,27 @@ async def websocket_transcribe(websocket: WebSocket):
                 sequence_value = message.get("sequence")
                 is_final = bool(message.get("is_final") or message.get("isFinal"))
                 sample_rate = message.get("sample_rate") or message.get("sampleRate")
-                print(f"DEBUG: sequence={sequence_value}, is_final={is_final}, sample_rate={sample_rate}")
+                message_targets = message.get("target_languages")
+                if message_targets is None and "targets" in message:
+                    message_targets = message.get("targets")
+                if message_targets is not None:
+                    session_target_languages = _parse_target_languages(message_targets)
+                raw_chunk_alternatives = (
+                    message.get("translation_alternatives")
+                    if "translation_alternatives" in message
+                    else message.get("alternatives")
+                )
+                if raw_chunk_alternatives is not None:
+                    session_alternative_limit = _coerce_alternative_limit(
+                        raw_chunk_alternatives
+                    )
+                
+                # Handle dynamic language hint updates
+                chunk_language = message.get("language")
+                if chunk_language is not None:
+                    language_hint = _normalize_language_hint(chunk_language)
+                
+                print(f"DEBUG: sequence={sequence_value}, is_final={is_final}, sample_rate={sample_rate}, lang_hint={language_hint}")
 
                 # Skip duplicate sequences
                 if (isinstance(sequence_value, int) and 
@@ -663,6 +1028,7 @@ async def websocket_transcribe(websocket: WebSocket):
                             "fullText": current_transcript,
                             "language": detected_language or language_hint or None,
                             "isFinal": True,
+                            "translations": current_translations,
                             **({"sequence": sequence_value} if isinstance(sequence_value, int) else {})
                         })
                     reset_session(clear_headers=False)
@@ -731,7 +1097,7 @@ async def websocket_transcribe(websocket: WebSocket):
                 
                 # Transcribe with same settings as chunked uploads for consistency
                 try:
-                    transcript, language_detected = await _transcribe_audio_blob(
+                    transcript, language_detected, translations = await _transcribe_audio_blob(
                         buffer_data,
                         mime_type,
                         channel_id,
@@ -739,6 +1105,8 @@ async def websocket_transcribe(websocket: WebSocket):
                         enable_vad=False,  # Keep VAD disabled for streaming to avoid premature truncation
                         is_streaming=True,  # Enable streaming-specific format handling
                         sample_rate=sample_rate,  # Pass sample rate for server-side resampling
+                        target_languages=session_target_languages,
+                        translation_alternative_limit=session_alternative_limit,
                     )
                 except TranscriptionError as exc:
                     error_detail = exc.detail
@@ -824,6 +1192,7 @@ async def websocket_transcribe(websocket: WebSocket):
                         "fullText": current_transcript,
                         "language": detected_language or language_hint or None,
                         "isFinal": True,
+                        "translations": current_translations,
                     }
                     if isinstance(sequence_value, int):
                         final_response["sequence"] = sequence_value
@@ -839,6 +1208,7 @@ async def websocket_transcribe(websocket: WebSocket):
                 # Update current transcript
                 if transcript:
                     current_transcript = transcript
+                    current_translations = translations
 
                 # Send transcriptions immediately like chunked uploads - no complex logic
                 should_send = bool(transcript.strip())  # Simple and fast like /transcribe endpoint
@@ -852,6 +1222,7 @@ async def websocket_transcribe(websocket: WebSocket):
                         "fullText": current_transcript,
                         "language": detected_language or language_hint or None,
                         "isFinal": is_final,
+                        "translations": translations,
                     }
                     if isinstance(sequence_value, int):
                         response["sequence"] = sequence_value
@@ -881,6 +1252,7 @@ async def websocket_transcribe(websocket: WebSocket):
                         "fullText": current_transcript,
                         "language": detected_language or language_hint or None,
                         "isFinal": True,
+                        "translations": current_translations,
                     })
                 break
 

@@ -1054,6 +1054,24 @@ async def websocket_transcribe(websocket: WebSocket):
                     chunk_sample_rate_int = int(chunk_sample_rate) if chunk_sample_rate is not None else None
                 except (TypeError, ValueError):
                     chunk_sample_rate_int = None
+                
+                # Handle dynamic parameter updates during active session
+                chunk_targets = message.get("target_languages")
+                if chunk_targets is None and "targets" in message:
+                    chunk_targets = message.get("targets")
+                if chunk_targets is not None:
+                    session.target_languages = _parse_target_languages(chunk_targets)
+                
+                chunk_alternative_limit = message.get("translation_alternatives")
+                if chunk_alternative_limit is None and "alternatives" in message:
+                    chunk_alternative_limit = message.get("alternatives")
+                if chunk_alternative_limit is not None:
+                    session.translation_alternative_limit = _coerce_alternative_limit(chunk_alternative_limit)
+                
+                chunk_language_hint = message.get("language")
+                if chunk_language_hint is not None:
+                    session.language_hint = chunk_language_hint if chunk_language_hint != "auto" else None
+                
                 await session.add_chunk(
                     chunk_bytes,
                     encoding=encoding,

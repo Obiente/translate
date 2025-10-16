@@ -5,7 +5,7 @@ import type {
 } from "../../types/conversation";
 import type { WhisperTranscriberManager } from "./useWhisperTranscriber";
 import { normalizeTranslationMap } from "../../utils/translation";
-const DEFAULT_CHUNK_INTERVAL_MS = 125;
+const DEFAULT_CHUNK_INTERVAL_MS = 300;
 const DEFAULT_KEEPALIVE_INTERVAL_MS = 5000;
 const DEFAULT_KEEPALIVE_TIMEOUT_MS = 45000;
 const RECONNECT_BASE_DELAY_MS = 500;
