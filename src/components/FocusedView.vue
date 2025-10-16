@@ -75,7 +75,7 @@
             :isFinal="unifiedFeed.isFinal"
             :speed="30"
             :centerOnStable="true"
-            overlayTop="clamp(80px, 14vh, 140px)"
+            :speakingChannels="activeChannelsWithContent"
           />
         </div>
       </template>
@@ -99,7 +99,7 @@
             :isFinal="unifiedFeed.isFinal"
             :speed="30"
             :centerOnStable="true"
-            overlayTop="clamp(56px, 12vh, 120px)"
+            :speakingChannels="activeChannelsWithContent"
           />
         </div>
       </template>

@@ -145,12 +145,6 @@
   flex-wrap: wrap;
 }
 
-.speaking-badges {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  flex-wrap: wrap;
-}
 
 .participant-count {
   font-size: 0.85rem;

@@ -1,33 +1,5 @@
 <template>
   <div class="spotify-lyrics-display" ref="containerRef">
-    <!-- Original text overlay (fixed, not inside scroll) shows current sentence's original -->
-    <div
-      v-if="currentOriginalText"
-      class="original-overlay"
-      aria-live="polite"
-      :style="overlayTopStyle"
-    >
-      <div class="original-text">
-        <span class="original-label">Original:</span>
-        {{ currentOriginalText }}
-      </div>
-    </div>
-
-    <!-- Speaker indicator if provided (component-level speaker; hidden when using per-sentence speakers) -->
-    <div
-      v-if="props.speaker && !hasPerSentenceSpeakers"
-      class="speaker-indicator"
-    >
-      <div
-        v-if="showInitials"
-        class="speaker-avatar"
-        :style="{ backgroundColor: getSpeakerColor(props.speaker) }"
-      >
-        {{ getSpeakerInitials(props.speaker) }}
-      </div>
-      <span class="speaker-name">{{ props.speaker }}</span>
-    </div>
-
     <!-- All sentences with typing animation -->
     <div
       v-for="(sentence, idx) in allSentences"
@@ -46,7 +18,11 @@
     >
       <!-- Speaker inline avatar (prefer sentence-level speaker; fallback to component-level) -->
       <div
-        v-if="showInitials && (sentence.speaker || props.speaker) && sentence.displayed"
+        v-if="
+          showInitials &&
+          (sentence.speaker || props.speaker) &&
+          sentence.displayed
+        "
         class="speaker-inline"
       >
         <div
@@ -65,11 +41,60 @@
         class="typing-cursor"
       ></span>
     </div>
+    <div v-if="props.speaker && !hasPerSentenceSpeakers" class="speaker-chip">
+      <div
+        v-if="showInitials"
+        class="speaker-avatar"
+        :style="{ backgroundColor: getSpeakerColor(props.speaker) }"
+      >
+        {{ getSpeakerInitials(props.speaker) }}
+      </div>
+      <span class="speaker-name">{{ props.speaker }}</span>
+    </div>
+
+    <!-- Bottom section with speaker chip and original text (fixed at bottom) -->
+    <div class="bottom-info">
+      <div
+        class="full-screen-participants-bar"
+        v-if="props.speakingChannels.length"
+      >
+        <ParticipantChip
+          v-for="p in speakingChannels"
+          :key="p.id"
+          :label="p.label"
+        />
+      </div>
+
+      <!-- Speaker chip if provided (component-level speaker; hidden when using per-sentence speakers) -->
+      <div v-if="props.speaker && !hasPerSentenceSpeakers" class="speaker-chip">
+        <div
+          v-if="showInitials"
+          class="speaker-avatar"
+          :style="{ backgroundColor: getSpeakerColor(props.speaker) }"
+        >
+          {{ getSpeakerInitials(props.speaker) }}
+        </div>
+        <span class="speaker-name">{{ props.speaker }}</span>
+      </div>
+
+      <!-- Original text -->
+      <div
+        v-if="currentOriginalText"
+        class="original-overlay"
+        aria-live="polite"
+      >
+        <div class="original-text">
+          <span class="original-label">Original:</span>
+          {{ currentOriginalText }}
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
 <script setup lang="ts">
   import { ref, computed, watch, nextTick, onUnmounted } from "vue";
+  import ParticipantChip from "./ParticipantChip.vue";
 
   interface SegmentInput {
     id?: string;
@@ -88,7 +113,7 @@
     isFinal?: boolean;
     centerOnStable?: boolean;
     segments?: SegmentInput[]; // New API: interleaved segments with per-sentence metadata
-    overlayTop?: string | number; // Optional override for original overlay top
+    speakingChannels?: Array<{ id: string; label: string }>; // Currently speaking participants
   }
 
   const props = withDefaults(defineProps<Props>(), {
@@ -100,7 +125,7 @@
     isFinal: false,
     centerOnStable: false,
     segments: () => [] as SegmentInput[],
-    overlayTop: undefined,
+    speakingChannels: () => [] as Array<{ id: string; label: string }>,
   });
 
   const containerRef = ref<HTMLElement | null>(null);
@@ -150,7 +175,9 @@
   // Only show initials if there is more than one unique speaker in the recent window
   // Focus on visible/active context: last few sentences that have some displayed text
   const showInitials = computed(() => {
-    let recent = allSentences.value.filter((s) => (s.displayed?.length ?? 0) > 0);
+    let recent = allSentences.value.filter(
+      (s) => (s.displayed?.length ?? 0) > 0
+    );
     if (recent.length === 0 && allSentences.value.length > 0) {
       // Nothing displayed yet: consider the latest sentence (current line)
       recent = [allSentences.value[allSentences.value.length - 1]];
@@ -163,15 +190,6 @@
       if (names.size > 1) return true;
     }
     return names.size > 1;
-  });
-  const overlayTopStyle = computed(() => {
-    if (props.overlayTop === undefined || props.overlayTop === null)
-      return {} as Record<string, string>;
-    const val =
-      typeof props.overlayTop === "number"
-        ? `${props.overlayTop}px`
-        : String(props.overlayTop);
-    return { top: val } as Record<string, string>;
   });
 
   // Split text into sentences (split on . ! ? followed by space or end of string)
@@ -519,7 +537,7 @@
     max-width: 900px;
     min-height: 100%;
     margin: 0 auto;
-    padding: 50vh 1rem;
+    padding: 50vh 1rem 200px 1rem;
     gap: 1.5rem;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
       sans-serif;
@@ -537,24 +555,34 @@
     height: 0;
   }
 
-  /* Fixed overlay for original text (outside inner scroll) */
-  .original-overlay {
+  /* Bottom info section - fixed at bottom with speaker chip above original text */
+  .bottom-info {
     position: fixed;
-    top: clamp(12px, 6vh, 72px);
+    bottom: 0;
     left: 50%;
     transform: translateX(-50%);
     width: 100%;
     max-width: min(900px, 90vw);
-    z-index: 2500;
-    pointer-events: none; /* do not block scroll/drag */
-    padding: 0 1rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.75rem;
+    padding: 1.5rem;
+    z-index: 1000;
+    pointer-events: auto;
+  }
+
+  /* Original text - positioned at bottom */
+  .original-overlay {
+    width: 100%;
+    max-width: 100%;
+    padding: 0;
   }
 
   /* Original text - small and dimmed */
   .original-text {
     width: 100%;
-    max-width: 90%;
-    margin: 0 auto;
     font-size: clamp(0.75rem, 1.8vw, 0.9rem);
     line-height: 1.4;
     font-weight: 400;
@@ -562,7 +590,7 @@
     text-align: center;
     opacity: 0.9;
     font-style: italic;
-    padding: 0.75rem 1rem;
+    padding: 0.5rem 1rem;
     background: rgba(0, 0, 0, 0.5);
     border-radius: 8px;
     border: 1px solid rgba(255, 255, 255, 0.08);
@@ -580,14 +608,32 @@
     margin-right: 0.5rem;
   }
 
-  /* Speaker indicator */
-  .speaker-indicator {
+  /* Speaker chip - above original text */
+  .speaker-chip {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    opacity: 0.9;
+  }
+
+  /* Speaking badges - participants currently speaking */
+  .speaking-badges {
     display: flex;
     align-items: center;
     justify-content: center;
     gap: 0.75rem;
-    margin-bottom: 2rem;
-    opacity: 0.8;
+    flex-wrap: wrap;
+  }
+
+  .badge-placeholder {
+    font-size: clamp(0.85rem, 2vw, 0.95rem);
+    font-weight: 600;
+    color: #ddd;
+    padding: 0.4rem 0.8rem;
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
   }
 
   .speaker-avatar {
@@ -663,7 +709,22 @@
   .sentence-text {
     display: inline;
   }
-
+  /* Participants fixed bar at top of fullscreen */
+  .focused-view.full-screen .full-screen-participants-bar {
+    top: clamp(8px, 4vh, 56px);
+    z-index: 3000;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    max-width: 90vw;
+    padding: 0.35rem 0.5rem;
+    background: rgba(0, 0, 0, 0.35);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 999px;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+  }
   .typing-cursor {
     display: inline-block;
     width: 3px;
@@ -683,7 +744,7 @@
   /* Responsive adjustments */
   @media (max-width: 768px) {
     .spotify-lyrics-display {
-      padding: 50vh 0.75rem;
+      padding: 50vh 0.75rem 180px 0.75rem;
       max-width: 100%;
       gap: 1.25rem;
     }
@@ -692,18 +753,14 @@
       line-height: 1.4;
     }
 
-    .original-overlay {
-      top: clamp(8px, 5vh, 56px);
-      padding: 0 0.75rem;
+    .bottom-info {
+      max-width: 100vw;
+      padding: 1rem 0.75rem;
     }
 
     .original-text {
       font-size: clamp(0.7rem, 2.5vw, 0.85rem);
-      padding: 0.5rem 0.75rem;
-    }
-
-    .speaker-indicator {
-      margin-bottom: 1.5rem;
+      padding: 0.4rem 0.5rem;
     }
 
     .speaker-avatar {
