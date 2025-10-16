@@ -11,7 +11,6 @@ import {
 } from "../constants/storage";
 import { useAudioCapture } from "../composables/useAudioCapture";
 import { useSpeechSynthesis } from "../composables/useSpeechSynthesis";
-import { useTranslationService } from "../composables/useTranslationService";
 import { useMicrophoneManager } from "../composables/liveTranslation/useMicrophoneManager";
 import { useWhisperTranscriber } from "./liveTranslation/useWhisperTranscriber";
 import type { WhisperTranscriberManager } from "./liveTranslation/useWhisperTranscriber";
@@ -106,12 +105,6 @@ export const useLiveTranslation = () => {
       !!navigator.mediaDevices?.getUserMedia,
   );
 
-  const LIVE_TRANSLATION_DEBOUNCE_MS = 450;
-  const liveTranslationTimers = new Map<
-    string,
-    ReturnType<typeof setTimeout>
-  >();
-  const liveTranslationRequests = new Map<string, symbol>();
 
   const sanitizeTranslationEntry = (
     entry: TranslationEntry | undefined | null,
@@ -178,7 +171,6 @@ export const useLiveTranslation = () => {
     );
   };
 
-  const { translateText, getSupportedLanguages } = useTranslationService();
   const {
     ensureMicrophonePermission,
     startDesktopCapture,
@@ -242,10 +234,7 @@ export const useLiveTranslation = () => {
           ? `${channel.liveTranscript} ${text}`.trim()
           : text;
       }
-      const trimmedFullText = fullText?.trim() ?? "";
-      const primaryPreview = trimmedFullText.length > 0
-        ? trimmedFullText
-        : channel.liveTranscript;
+  // Server drives live translations
       const normalizedTranslations = translations ?? {};
       const filteredServerTranslations = filterTranslationEntries(
         normalizedTranslations,
@@ -255,18 +244,11 @@ export const useLiveTranslation = () => {
         Object.keys(filteredServerTranslations).length > 0;
 
       if (isFinal) {
-        clearLiveTranslationSchedule(channel.id);
-        channel.liveTranslations = {};
-        if (!hasServerTranslations) {
-          resetLiveTranslations(channel);
-        }
+        channel.liveTranslations = hasServerTranslations ? filteredServerTranslations : {};
       } else if (hasServerTranslations) {
-        clearLiveTranslationSchedule(channel.id);
         channel.liveTranslations = filteredServerTranslations;
-      } else if (primaryPreview) {
-        scheduleLiveTranslation(channel, primaryPreview);
       } else {
-        resetLiveTranslations(channel);
+        channel.liveTranslations = {};
       }
 
       await handleFinalTranscript(channel, {
@@ -302,10 +284,7 @@ export const useLiveTranslation = () => {
           : text;
       }
 
-      const trimmedFullText = fullText?.trim() ?? "";
-      const primaryPreview = trimmedFullText.length > 0
-        ? trimmedFullText
-        : channel.liveTranscript;
+  // Server drives live translations
       const normalizedTranslations = translations ?? {};
       const filteredServerTranslations = filterTranslationEntries(
         normalizedTranslations,
@@ -315,18 +294,11 @@ export const useLiveTranslation = () => {
         Object.keys(filteredServerTranslations).length > 0;
 
       if (isFinal) {
-        clearLiveTranslationSchedule(channel.id);
-        channel.liveTranslations = {};
-        if (!hasServerTranslations) {
-          resetLiveTranslations(channel);
-        }
+        channel.liveTranslations = hasServerTranslations ? filteredServerTranslations : {};
       } else if (hasServerTranslations) {
-        clearLiveTranslationSchedule(channel.id);
         channel.liveTranslations = filteredServerTranslations;
-      } else if (primaryPreview) {
-        scheduleLiveTranslation(channel, primaryPreview);
       } else {
-        resetLiveTranslations(channel);
+        channel.liveTranslations = {};
       }
 
       await handleFinalTranscript(channel, {
@@ -363,49 +335,12 @@ export const useLiveTranslation = () => {
     const finalText = (channel.lastFinalTranscript || assembledFinal || "")
       .trim();
 
-    // If translations were provided by the server, use those; otherwise compute them now
-    let translationMap: Record<string, TranslationEntry> = {};
+    // Use only server-provided translations; do not compute client-side
+    let translationMap: Record<string, TranslationEntry> =
+      providedTranslations && Object.keys(providedTranslations).length > 0
+        ? providedTranslations
+        : {};
     let detectedFromTranslations: string | null = null;
-
-    if (providedTranslations && Object.keys(providedTranslations).length > 0) {
-      translationMap = providedTranslations;
-    } else if (channel.targetLanguages.length > 0) {
-      // Compute translations just-in-time to ensure they match the final text
-      try {
-        const altLimit = resolveAlternativeLimit();
-        const translationResults = await Promise.all(
-          channel.targetLanguages.map(async (target) => {
-            const result = await translateText(
-              finalText,
-              channel.sourceLanguage === "auto"
-                ? "auto"
-                : channel.sourceLanguage,
-              target,
-              altLimit,
-            );
-            return {
-              target,
-              entry: sanitizeTranslationEntry({
-                primary: result.translatedText,
-                alternatives: Array.isArray(result.alternatives)
-                  ? result.alternatives
-                  : [],
-              }),
-              detectedLanguage: result.detectedLanguage,
-            };
-          }),
-        );
-
-        translationResults.forEach((entry) => {
-          if (entry.entry) translationMap[entry.target] = entry.entry;
-          if (!detectedFromTranslations && entry.detectedLanguage) {
-            detectedFromTranslations = entry.detectedLanguage;
-          }
-        });
-      } catch (error) {
-        console.warn("Translation at history-finalize failed", error);
-      }
-    }
 
     // Save translations to the channel state for UI (merge)
     if (Object.keys(translationMap).length > 0) {
@@ -431,6 +366,8 @@ export const useLiveTranslation = () => {
 
     // Cleanup: clear live transcript and translating state
     channel.liveTranscript = "";
+    // Also clear live translations now that the final has been committed to history
+    channel.liveTranslations = {};
     channel.isTranslating = false;
   }
 
@@ -546,110 +483,7 @@ export const useLiveTranslation = () => {
     );
   };
 
-  const clearLiveTranslationSchedule = (channelId: string): void => {
-    const timer = liveTranslationTimers.get(channelId);
-    if (timer !== undefined) {
-      clearTimeout(timer);
-      liveTranslationTimers.delete(channelId);
-    }
-    liveTranslationRequests.delete(channelId);
-  };
-
-  const resetLiveTranslations = (channel: ConversationChannel): void => {
-    clearLiveTranslationSchedule(channel.id);
-    if (Object.keys(channel.liveTranslations).length > 0) {
-      channel.liveTranslations = {};
-    }
-  };
-
-  const scheduleLiveTranslation = (
-    channel: ConversationChannel,
-    text: string,
-  ): void => {
-    const trimmed = text.trim();
-    const channelId = channel.id;
-
-    if (!trimmed || channel.targetLanguages.length === 0) {
-      resetLiveTranslations(channel);
-      return;
-    }
-
-    const alternativeLimit = resolveAlternativeLimit();
-
-    const existingTimer = liveTranslationTimers.get(channelId);
-    if (existingTimer !== undefined) {
-      clearTimeout(existingTimer);
-    }
-
-    liveTranslationTimers.set(
-      channelId,
-      setTimeout(async () => {
-        liveTranslationTimers.delete(channelId);
-        const requestToken = Symbol(channelId);
-        liveTranslationRequests.set(channelId, requestToken);
-
-        try {
-          ensureTargets(channel);
-          if (channel.targetLanguages.length === 0) {
-            resetLiveTranslations(channel);
-            return;
-          }
-
-          const translationResults = await Promise.all(
-            channel.targetLanguages.map(async (target) => {
-              const result = await translateText(
-                trimmed,
-                channel.sourceLanguage === "auto"
-                  ? "auto"
-                  : channel.sourceLanguage,
-                target,
-                alternativeLimit,
-              );
-              return {
-                target,
-                entry: sanitizeTranslationEntry({
-                  primary: result.translatedText,
-                  alternatives: Array.isArray(result.alternatives)
-                    ? result.alternatives
-                    : [],
-                }),
-              };
-            }),
-          );
-
-          if (liveTranslationRequests.get(channelId) !== requestToken) {
-            return;
-          }
-
-          const liveUpdates: Record<string, TranslationEntry> = {};
-          translationResults.forEach(({ target, entry }) => {
-            if (entry) {
-              liveUpdates[target] = entry;
-            }
-          });
-
-          if (Object.keys(liveUpdates).length === 0) {
-            resetLiveTranslations(channel);
-            return;
-          }
-
-          channel.liveTranslations = filterTranslationEntries(
-            {
-              ...channel.liveTranslations,
-              ...liveUpdates,
-            },
-            channel.targetLanguages,
-          );
-        } catch (error) {
-          console.warn("Live translation update failed", error);
-        } finally {
-          if (liveTranslationRequests.get(channelId) === requestToken) {
-            liveTranslationRequests.delete(channelId);
-          }
-        }
-      }, LIVE_TRANSLATION_DEBOUNCE_MS),
-    );
-  };
+  // Client-side live translation scheduling removed.
 
   const ensureSelectedChannel = (): void => {
     if (channels.value.length === 0) {
@@ -1335,14 +1169,7 @@ export const useLiveTranslation = () => {
 
     await microphoneManager.refresh();
 
-    try {
-      const supported = await getSupportedLanguages();
-      if (supported.length) {
-        languages.value = supported;
-      }
-    } catch (error) {
-      console.warn("Failed to fetch supported languages", error);
-    }
+    // Keep default language list; server handles translations
 
     if (!restoredFromStorage && channels.value.length === 0) {
       addChannel(createChannel("microphone", "Participant A", "en", ["es"]));
