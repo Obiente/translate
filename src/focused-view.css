@@ -1,34 +1,6 @@
 /* Focused View - Spotify/Musixmatch Style */
 
-/* Base Button Styles */
-.button {
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  background: rgba(255, 255, 255, 0.08);
-  color: inherit;
-  padding: 0.5rem 1rem;
-  border-radius: 6px;
-  cursor: pointer;
-  transition: all 0.2s ease;
-  font: inherit;
-  min-height: 40px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.5rem;
-  white-space: nowrap;
-  user-select: none;
-  -webkit-user-select: none;
-  touch-action: manipulation;
-}
-
-.button:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.12);
-  transform: translateY(-1px);
-}
-
-.button:active {
-  transform: translateY(0);
-}
+/* Buttons share global base styles from src/style.css */
 
 /* Focus Toggle Button */
 .button.focus-toggle {
@@ -104,7 +76,7 @@
   padding-top: env(safe-area-inset-top, 0);
   padding-left: env(safe-area-inset-left, 0);
   padding-right: env(safe-area-inset-right, 0);
-  background: linear-gradient(135deg, #0f0f0f 0%, #1a1a1a 50%, #0f0f0f 100%);
+  background: var(--bg-gradient);
   border-radius: 0;
   border: none;
   min-height: 100vh;
@@ -702,33 +674,7 @@
   -webkit-backdrop-filter: blur(8px);
 }
 
-.focused-view.full-screen .full-screen-participants-bar .participant-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.4rem;
-  padding: 0.25rem 0.6rem;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.06);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-}
-
-.focused-view.full-screen .participant-chip .chip-avatar {
-  width: 22px;
-  height: 22px;
-  border-radius: 50%;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 0.65rem;
-  font-weight: 800;
-  color: #fff;
-}
-
-.focused-view.full-screen .participant-chip .chip-name {
-  font-size: 0.8rem;
-  font-weight: 600;
-  color: #ddd;
-}
+/* Chip visuals are scoped in ParticipantChip.vue; container remains here */
 
 .focused-view.full-screen .full-screen-feed .focused-history-item,
 .focused-view.full-screen .full-screen-feed .focused-transcription {
@@ -753,7 +699,7 @@
 
 .focused-view.full-screen .lyrics-display .translation-line {
   text-align: center;
-  max-width: min(80ch, 88vw);
+  max-width: min(90ch, 90vw);
   margin: 0 auto;
   white-space: normal;
   word-break: break-word;

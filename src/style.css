@@ -1,11 +1,24 @@
 :root {
+  /* Typography */
   font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
   line-height: 1.5;
   font-weight: 400;
 
-  color-scheme: light dark;
-  color: rgba(255, 255, 255, 0.87);
-  background-color: #242424;
+  /* Dark theme palette */
+  --bg: #0f0f0f;
+  --bg-gradient: linear-gradient(135deg, #0f0f0f 0%, #1a1a1a 50%, #0f0f0f 100%);
+  --surface: rgba(255, 255, 255, 0.04);
+  --surface-2: rgba(255, 255, 255, 0.08);
+  --border: rgba(255, 255, 255, 0.08);
+  --text: #e8e8e8;
+  --muted: #b0b0b0;
+  --accent: #1db954; /* Spotify green */
+  --accent-2: #646cff; /* Vite purple */
+  --danger: #ef5350;
+  --success: #48bb78;
+
+  color-scheme: dark;
+  color: var(--text);
 
   font-synthesis: none;
   text-rendering: optimizeLegibility;
@@ -18,72 +31,93 @@
   box-sizing: border-box;
 }
 
-body {
+html, body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
+  background: var(--bg-gradient);
 }
 
 #app {
   width: 100%;
+  color: var(--text);
 }
 
-.card {
-  padding: 2em;
-  background: rgba(255, 255, 255, 0.1);
-  border-radius: 8px;
+/* Panels & cards */
+.card, .panel, .surface {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
   backdrop-filter: blur(10px);
-  margin: 1rem 0;
 }
 
+/* Buttons - global minimal style */
 .button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  background-color: #1a1a1a;
-  color: white;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.08);
+  color: inherit;
+  padding: 0.5rem 1rem;
+  border-radius: 10px;
   cursor: pointer;
-  transition: border-color 0.25s;
-  margin: 0.25rem;
+  transition: all 0.2s ease;
+  font: inherit;
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  white-space: nowrap;
+  user-select: none;
 }
 
-.button:hover {
-  border-color: #646cff;
+.button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.12);
+  transform: translateY(-1px);
 }
 
-.button:focus,
-.button:focus-visible {
-  outline: 4px auto -webkit-focus-ring-color;
+.button:active {
+  transform: translateY(0);
+}
+
+.button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .button.primary {
-  background-color: #646cff;
+  background: var(--accent-2);
+  border-color: var(--accent-2);
+  color: #fff;
 }
 
-.button.danger {
-  background-color: #f56565;
+.button.success { background: var(--success); border-color: var(--success); color: #fff; }
+.button.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+.button.active { background: var(--danger); border-color: var(--danger); color: #fff; }
+
+/* Inputs */
+select,
+input[type="text"],
+input[type="search"],
+input[type="number"],
+textarea {
+  background: rgba(0, 0, 0, 0.35);
+  color: inherit;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 8px;
+  padding: 0.6rem 0.75rem;
+  font: inherit;
 }
 
-.button.success {
-  background-color: #48bb78;
-}
+label { color: var(--muted); }
 
+/* Recording button pulse utility (unique name) */
 .button.recording {
   background-color: #e53e3e;
-  animation: pulse 1s infinite;
+  animation: recordingPulse 1s infinite;
 }
 
-@keyframes pulse {
-  0% {
-    box-shadow: 0 0 0 0 rgba(229, 62, 62, 0.7);
-  }
-  70% {
-    box-shadow: 0 0 0 10px rgba(229, 62, 62, 0);
-  }
-  100% {
-    box-shadow: 0 0 0 0 rgba(229, 62, 62, 0);
-  }
+@keyframes recordingPulse {
+  0% { box-shadow: 0 0 0 0 rgba(229, 62, 62, 0.7); }
+  70% { box-shadow: 0 0 0 10px rgba(229, 62, 62, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(229, 62, 62, 0); }
 }

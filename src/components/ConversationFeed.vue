@@ -170,4 +170,3 @@
     )
   );
 </script>
-<style scoped src="../focused-view.css"></style>
