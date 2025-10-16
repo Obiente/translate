@@ -4,7 +4,9 @@ import type {
     TranslationEntry,
 } from "../../types/conversation";
 import type { WhisperTranscriberManager } from "./useWhisperTranscriber";
+import { watch } from "vue";
 import { normalizeTranslationMap } from "../../utils/translation";
+import { useRoomManager } from "../useRoomManager";
 const DEFAULT_CHUNK_INTERVAL_MS = 300;
 const DEFAULT_KEEPALIVE_INTERVAL_MS = 5000;
 const DEFAULT_KEEPALIVE_TIMEOUT_MS = 45000;
@@ -175,6 +177,78 @@ export const useStreamingWhisperTranscriber = (
     } = options;
 
     const states = new Map<string, StreamingState>();
+    // Room integration: reuse the room websocket if present
+    const room = useRoomManager();
+
+    // Keep streaming sockets joined to the current room even if the user joins later
+    // or if the streaming connection is separate from the room manager socket.
+    watch(
+        () => room.roomId.value,
+        (newRoomId, oldRoomId) => {
+            // If leaving a room, notify all active streaming sockets as well
+            if (!newRoomId && oldRoomId) {
+                states.forEach((state) => {
+                    const socket = state.websocket;
+                    if (socket && socket.readyState === WebSocket.OPEN) {
+                        sendJson(socket, { type: "leave_room" });
+                    }
+                });
+                return;
+            }
+
+            // If joining or switching rooms, send join to every active streaming socket
+            if (newRoomId) {
+                states.forEach((state) => {
+                    // Ensure we have a socket (this may reuse the room socket)
+                    const socket = state.websocket ?? room.ensureSocket();
+                    if (socket.readyState === WebSocket.OPEN) {
+                        sendJson(socket, {
+                            type: "join_room",
+                            room_id: newRoomId,
+                            peer_id: room.peerId.value ?? undefined,
+                            peer_label: room.peerLabel.value ?? undefined,
+                        });
+                    } else {
+                        socket.addEventListener(
+                            "open",
+                            () =>
+                                sendJson(socket, {
+                                    type: "join_room",
+                                    room_id: newRoomId,
+                                    peer_id: room.peerId.value ?? undefined,
+                                    peer_label: room.peerLabel.value ?? undefined,
+                                }),
+                            { once: true },
+                        );
+                    }
+                });
+            }
+        },
+        { immediate: false },
+    );
+
+    // Keep peer identity synchronized across sockets; if peerId changes, re-send join to update server-side identity
+    watch(
+        () => room.peerId.value,
+        (newPeerId) => {
+            if (!room.roomId.value) return;
+            states.forEach((state) => {
+                const socket = state.websocket ?? room.ensureSocket();
+                const payload: Record<string, unknown> = {
+                    type: "join_room",
+                    room_id: room.roomId.value,
+                    peer_id: newPeerId ?? undefined,
+                    peer_label: room.peerLabel.value ?? undefined,
+                };
+                if (socket.readyState === WebSocket.OPEN) {
+                    sendJson(socket, payload);
+                } else {
+                    socket.addEventListener("open", () => sendJson(socket, payload), { once: true });
+                }
+            });
+        },
+        { immediate: false },
+    );
 
     const clearKeepalive = (state: StreamingState): void => {
         if (state.keepaliveTimer !== null) {
@@ -410,6 +484,12 @@ export const useStreamingWhisperTranscriber = (
             sample_rate: state.sampleRate,
             is_final: isFinal,
         };
+        // Attach room metadata for implicit join/continuity on the server
+        if (room.roomId.value) {
+            payload.room_id = room.roomId.value;
+            if (room.peerId.value) payload.peer_id = room.peerId.value;
+            if (room.peerLabel.value) payload.peer_label = room.peerLabel.value;
+        }
         if (targets.length > 0) {
             payload.target_languages = targets;
         }
@@ -547,7 +627,17 @@ export const useStreamingWhisperTranscriber = (
 
         clearReconnect(state);
 
-        const websocket = new WebSocket(endpoint);
+        // Reuse existing socket from room if pointing to same endpoint; otherwise create new
+        const canReuseRoomSocket = (() => {
+            try {
+                const url = new URL(endpoint);
+                const configured = (import.meta.env.VITE_WHISPER_STREAMING_ENDPOINT as string | undefined)?.trim() || endpoint;
+                const roomUrl = new URL(configured);
+                return url.host === roomUrl.host && url.pathname === roomUrl.pathname;
+            } catch { return false; }
+        })();
+
+        const websocket = canReuseRoomSocket ? room.ensureSocket() : new WebSocket(endpoint);
         state.websocket = websocket;
         state.sequence = 0;
         state.finalChunkSent = false;
@@ -574,7 +664,14 @@ export const useStreamingWhisperTranscriber = (
 
         attachSocketHandlers(state, websocket);
 
-        await openPromise;
+        if (!canReuseRoomSocket) {
+            await openPromise;
+        } else {
+            // If reusing, ensure it's open
+            if (websocket.readyState !== WebSocket.OPEN) {
+                await openPromise;
+            }
+        }
 
         state.reconnectAttempts = 0;
         state.lastKeepaliveAt = Date.now();
@@ -584,6 +681,12 @@ export const useStreamingWhisperTranscriber = (
             type: "start",
             channel_id: state.channel.id,
         };
+        // Attach room metadata as part of start for server-side implicit join
+        if (room.roomId.value) {
+            payload["room_id"] = room.roomId.value;
+            if (room.peerId.value) payload["peer_id"] = room.peerId.value;
+            if (room.peerLabel.value) payload["peer_label"] = room.peerLabel.value;
+        }
 
         if (
             state.channel.sourceLanguage &&
@@ -604,6 +707,17 @@ export const useStreamingWhisperTranscriber = (
         );
         if (alternativeLimit > 0) {
             payload.translation_alternatives = alternativeLimit;
+        }
+
+        // Attach to any joined room if present
+        if (room.roomId.value) {
+            // Ask server to join room on this socket (idempotent)
+            sendJson(websocket, {
+                type: "join_room",
+                room_id: room.roomId.value,
+                peer_id: room.peerId.value ?? undefined,
+                peer_label: room.peerLabel.value ?? undefined,
+            });
         }
 
         sendJson(websocket, payload);

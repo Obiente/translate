@@ -11,6 +11,14 @@
             :label="channel.label"
           />
         </div>
+        <!-- Always show room participants (avatars) when in a room, even if no one is actively speaking -->
+        <div class="participants-bar" v-if="participants.length">
+          <ParticipantChip
+            v-for="p in participants"
+            :key="p.id"
+            :label="p.label + (p.sourceType === 'room' ? ' · room' : '')"
+          />
+        </div>
         <div class="channel-chips">
           <ParticipantChip
             v-for="channel in props.channels"
@@ -75,6 +83,7 @@
             :isFinal="unifiedFeed.isFinal"
             :speed="30"
             :centerOnStable="true"
+            :alwaysShowInitials="room.isInRoom()"
             :speakingChannels="activeChannelsWithContent"
           />
         </div>
@@ -86,7 +95,7 @@
           <ParticipantChip
             v-for="p in participants"
             :key="p.id"
-            :label="p.label"
+            :label="p.label + (p.sourceType === 'room' ? ' · room' : '')"
           />
         </div>
         <div
@@ -99,6 +108,7 @@
             :isFinal="unifiedFeed.isFinal"
             :speed="30"
             :centerOnStable="true"
+            :alwaysShowInitials="room.isInRoom()"
             :speakingChannels="activeChannelsWithContent"
           />
         </div>
@@ -109,7 +119,8 @@
         class="focused-empty"
         v-if="
           !activeChannelsWithContent.length &&
-          !recentHistoryWithTranslations.length
+          !recentHistoryWithTranslations.length &&
+          !participants.length
         "
       >
         <div class="empty-animation">
@@ -132,6 +143,7 @@
 
 <script setup lang="ts">
   import { ref, computed, onMounted, onUnmounted } from "vue";
+  import { useRoomManager } from "../composables/useRoomManager";
 
   // ...existing code...
 
@@ -249,11 +261,36 @@
 
   // Utilities moved into ParticipantChip component
 
-  const participants = computed(() =>
-    props.channels
-      .filter((c) => c.isActive)
-      .map((c) => ({ id: c.id, label: c.label }))
-  );
+  // Merge active channel speakers with room roster so avatars/names show even when mic is off.
+  const room = useRoomManager();
+  const participants = computed(() => {
+    const map = new Map<string, { id: string; label: string; sourceType: 'channel' | 'room' }>();
+    const hasLocalActive = props.channels.some((c) => c.isActive && (c as any).sourceType !== 'room');
+    // Helper: does a channel exist with given id (covers synthetic room channels too)
+    const hasChannelId = (id: string) => props.channels.some((c) => c.id === id && c.isActive);
+
+    // Active channels (include both microphone/system and synthetic 'room' channels)
+    for (const c of props.channels) {
+      if (c.isActive) {
+        const st = (c as any).sourceType === 'room' ? 'room' : 'channel';
+        map.set(`ch:${c.id}`, { id: `ch:${c.id}`, label: c.label, sourceType: st });
+      }
+    }
+    // Room roster
+    if (room.isInRoom()) {
+      for (const m of room.members) {
+        const pid = m.peerId || 'unknown';
+        const label = m.peerLabel || 'Guest';
+        // Skip if this peer is already represented by an active channel (synthetic room channel uses peerId as channel id)
+        if (pid && hasChannelId(pid)) continue;
+        // If this is self and we have any local active channel, prefer the local channel representation
+        const isSelf = !!room.peerId.value && pid === room.peerId.value;
+        if (isSelf && hasLocalActive) continue;
+        if (!map.has(`room:${pid}`)) map.set(`room:${pid}`, { id: `room:${pid}`, label, sourceType: 'room' });
+      }
+    }
+    return Array.from(map.values());
+  });
 
   // Choose a display language across the conversation
   const chooseDisplayLanguage = (): string | null => {

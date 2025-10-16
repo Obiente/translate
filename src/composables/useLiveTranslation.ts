@@ -25,6 +25,7 @@ import type {
   TranslationEntry,
 } from "../types/conversation";
 import { normalizeTranslationMap } from "../utils/translation";
+import { useRoomManager } from './useRoomManager';
 
 interface FinalTranscriptPayload {
   fullText?: string;
@@ -186,6 +187,8 @@ export const useLiveTranslation = () => {
     support,
   } = useAudioCapture();
   const { speak, isSpeaking } = useSpeechSynthesis();
+  // Rooms: central manager for joining and receiving shared transcripts
+  const room = useRoomManager();
 
   const microphoneManager = useMicrophoneManager({
     channels,
@@ -662,7 +665,9 @@ export const useLiveTranslation = () => {
   };
 
   const serializeChannels = () =>
-    channels.value.map((channel) => ({
+    channels.value
+      .filter((channel) => channel.sourceType !== 'room')
+      .map((channel) => ({
       id: channel.id,
       label: channel.label,
       sourceType: channel.sourceType,
@@ -954,6 +959,67 @@ export const useLiveTranslation = () => {
       );
     }
   };
+
+  // Receive incoming room transcripts and reflect them in history as synthetic entries
+  watch(
+    () => room.transcripts.length,
+    () => {
+      const latest = room.transcripts[room.transcripts.length - 1];
+      if (!latest) return;
+      // Create or find a virtual room channel for the peer if needed
+      const label = (latest.peerLabel || `Peer ${latest.peerId?.slice(0, 4) ?? ''}`).trim();
+      // Prefer a stable key: channelId if provided, else peerId, else room-scoped fallback
+      const channelId = latest.channelId || latest.peerId || `room-${latest.roomId}`;
+      const existing = channels.value.find((c) => c.id === channelId);
+      const ensureChan = existing ?? createChannel('room', label || 'Peer', 'auto', [], false, channelId);
+      if (!existing) {
+        ensureChan.isActive = true; // room channels are driven by remote events
+        addChannel(ensureChan);
+      }
+      // Ensure visible in live area when we receive remote updates
+      ensureChan.isActive = true;
+
+      const text = (latest.text || '').trim();
+      const fullText = (latest.fullText || '').trim();
+      const isFinal = Boolean(latest.isFinal);
+      const normalizedTranslations = normalizeTranslationMap(latest.translations);
+
+      if (!isFinal) {
+        // Update live transcript/translation preview for room channel
+        if (fullText) {
+          ensureChan.liveTranscript = fullText;
+        } else if (text) {
+          ensureChan.liveTranscript = ensureChan.liveTranscript
+            ? `${ensureChan.liveTranscript} ${text}`.trim()
+            : text;
+        }
+        // If server provided translations, show them live
+        if (Object.keys(normalizedTranslations).length > 0) {
+          ensureChan.liveTranslations = normalizedTranslations;
+        }
+        return;
+      }
+
+      // Final: push to history and clear live preview
+      const finalText = (fullText || text).trim();
+      if (!finalText) return;
+
+      conversationHistoryPush({
+        id: createId(),
+        channelId: ensureChan.id,
+        channelLabel: ensureChan.label,
+        sourceLanguage: ensureChan.sourceLanguage,
+        detectedLanguage: latest.language ?? null,
+        transcript: finalText,
+        translations: normalizedTranslations,
+        timestamp: latest.timestamp,
+      });
+
+      ensureChan.lastFinalTranscript = finalText;
+      ensureChan.liveTranscript = '';
+      ensureChan.liveTranslations = {};
+    },
+  );
 
   const formatTimestamp = (iso: string): string => {
     const time = new Date(iso);

@@ -7,7 +7,10 @@
       :key="`live-${channel.id}`"
     >
       <div class="speaker-badge live">
-        <div class="speaker-name">{{ channel.label }}</div>
+        <div class="speaker-name">
+          {{ channel.label }}
+          <span v-if="(channel as any).sourceType === 'room'" class="source-badge">room</span>
+        </div>
         <div class="live-pulse"></div>
       </div>
 
@@ -56,7 +59,9 @@
     <!-- Final messages from history -->
     <div class="message" v-for="entry in recentHistory" :key="entry.id">
       <div class="speaker-badge final">
-        <div class="speaker-name">{{ entry.channelLabel }}</div>
+        <div class="speaker-name">
+          {{ entry.channelLabel }}
+        </div>
         <div class="timestamp">{{ formatTime(entry.timestamp) }}</div>
       </div>
 

@@ -114,6 +114,8 @@
     centerOnStable?: boolean;
     segments?: SegmentInput[]; // New API: interleaved segments with per-sentence metadata
     speakingChannels?: Array<{ id: string; label: string }>; // Currently speaking participants
+    // When true, always show speaker initials/avatar regardless of unique speaker count
+    alwaysShowInitials?: boolean;
   }
 
   const props = withDefaults(defineProps<Props>(), {
@@ -126,6 +128,7 @@
     centerOnStable: false,
     segments: () => [] as SegmentInput[],
     speakingChannels: () => [] as Array<{ id: string; label: string }>,
+    alwaysShowInitials: false,
   });
 
   const containerRef = ref<HTMLElement | null>(null);
@@ -175,6 +178,7 @@
   // Only show initials if there is more than one unique speaker in the recent window
   // Focus on visible/active context: last few sentences that have some displayed text
   const showInitials = computed(() => {
+    if (props.alwaysShowInitials) return true;
     let recent = allSentences.value.filter(
       (s) => (s.displayed?.length ?? 0) > 0
     );

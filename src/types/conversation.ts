@@ -15,7 +15,7 @@ export interface LanguageOption {
   name: string;
 }
 
-export type ChannelType = "microphone" | "system";
+export type ChannelType = "microphone" | "system" | "room";
 
 export interface TranslationEntry {
   primary: string;
