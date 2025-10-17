@@ -214,6 +214,8 @@
     liveTranscript: string;
     liveTranslations: Record<string, Translation>;
     isFinal?: boolean;
+    // Used to choose which translation to display per channel
+    targetLanguages?: string[];
   }
 
   interface HistoryEntry {
@@ -292,23 +294,7 @@
     return Array.from(map.values());
   });
 
-  // Helper: choose the best translation for a given item based on preferred codes
-  const chooseTranslationFor = (
-    translations: Record<string, Translation> | undefined,
-    preferredCodes: string[] | undefined,
-  ): Translation | undefined => {
-    if (!translations) return undefined;
-    const prefs = (preferredCodes || []).map((c) => c.trim()).filter(Boolean);
-    for (const code of prefs) {
-      const t = translations[code];
-      if (t && (t.primary?.trim() || t.alternatives?.length)) return t;
-    }
-    // Sensible defaults: prefer English if present
-    if (translations.en) return translations.en;
-    // Otherwise first available
-    const first = Object.values(translations)[0];
-    return first;
-  };
+  // No global display language — pick per-channel translation and never fall back to original
 
   type Segment = {
     id?: string;
@@ -320,30 +306,35 @@
   const unifiedFeed = computed(() => {
     const segs: Segment[] = [];
 
+    // Build quick lookup for channels by id
+    const channelById = new Map(props.channels.map((c) => [c.id, c] as const));
+
     // History first (already finalized), sorted by timestamp ascending
     const history = [...recentHistoryWithTranslations.value].sort(
       (a, b) =>
         new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
     );
     for (const entry of history) {
-      // Prefer the channel's targetLanguages if we can resolve the channel
-      const chPref = props.channels.find((c) => c.id === entry.channelId);
-      const t: Translation | undefined = chooseTranslationFor(
-        entry.translations,
-        (chPref as any)?.targetLanguages as string[] | undefined,
-      );
-      const text = (
-        t?.primary ||
-        (t?.alternatives?.[0] ?? "") ||
-        entry.transcript ||
-        ""
-      ).trim();
+      const ch = channelById.get(entry.channelId);
+      const preferred = Array.isArray(ch?.targetLanguages)
+        ? ch!.targetLanguages!
+        : [];
+      const translations = entry.translations || {};
+      let chosen: Translation | undefined;
+      for (const code of preferred) {
+        if (translations[code]) { chosen = translations[code]; break; }
+      }
+      if (!chosen) {
+        const firstCode = Object.keys(translations)[0];
+        if (firstCode) chosen = translations[firstCode];
+      }
+      if (!chosen) continue; // No server translation; do not show original
+      const text = (chosen.primary || chosen.alternatives?.[0] || "").trim();
       if (!text) continue;
-      const originalText = t ? entry.transcript || "" : undefined;
       segs.push({
         id: `h-${entry.id}`,
         text,
-        originalText,
+        originalText: undefined,
         speaker: entry.channelLabel,
         timestamp: entry.timestamp,
       });
@@ -351,23 +342,23 @@
 
     // Live segments (one per channel), placed at the end as the most recent
     for (const ch of props.channels) {
-      // Choose per-channel based on its own targetLanguages
-      const t: Translation | undefined = chooseTranslationFor(
-        ch.liveTranslations,
-        (ch as any)?.targetLanguages as string[] | undefined,
-      );
-      const live = t?.primary
-        ? t.primary
-        : Array.isArray(t?.alternatives) && t.alternatives.length
-        ? t.alternatives[0]
-        : "";
-      const text = (live || ch.liveTranscript || "").trim();
+      const preferred = Array.isArray(ch.targetLanguages) ? ch.targetLanguages : [];
+      const translations = ch.liveTranslations || {};
+      let chosen: Translation | undefined;
+      for (const code of preferred) {
+        if (translations[code]) { chosen = translations[code]; break; }
+      }
+      if (!chosen) {
+        const firstCode = Object.keys(translations)[0];
+        if (firstCode) chosen = translations[firstCode];
+      }
+      if (!chosen) continue; // No server translation yet — do not show original/liveTranscript
+      const text = (chosen.primary || chosen.alternatives?.[0] || "").trim();
       if (!text) continue;
-      const originalText = live ? ch.liveTranscript || "" : undefined;
       segs.push({
         id: `l-${ch.id}`,
         text,
-        originalText,
+        originalText: undefined,
         speaker: ch.label,
         timestamp: Date.now(),
       });
