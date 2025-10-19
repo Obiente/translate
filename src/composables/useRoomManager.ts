@@ -43,6 +43,11 @@ let _reconnectAttempts = 0;
 
 const ROOM_PERSIST_KEY = 'obiente_room_state';
 
+const createPeerId = (): string =>
+  typeof crypto !== 'undefined' && 'randomUUID' in crypto
+    ? crypto.randomUUID()
+    : Math.random().toString(36).slice(2, 12);
+
 // Restore persisted room session (best-effort)
 try {
   const raw = typeof window !== 'undefined' ? localStorage.getItem(ROOM_PERSIST_KEY) : null;
@@ -84,7 +89,12 @@ export const useRoomManager = () => {
       startKeepalive(ws);
       // If we already picked a room, re-join it
       if (roomId.value) {
-        joinRoom(roomId.value, peerId.value ?? undefined, peerLabel.value ?? undefined);
+        // Ensure we have a stable peerId before (re)joining
+        if (!peerId.value) {
+          peerId.value = createPeerId();
+          try { localStorage.setItem(ROOM_PERSIST_KEY, JSON.stringify({ roomId: roomId.value, peerId: peerId.value, peerLabel: peerLabel.value })); } catch {}
+        }
+        joinRoom(roomId.value, peerId.value, peerLabel.value ?? undefined);
       }
     });
 
@@ -130,12 +140,10 @@ export const useRoomManager = () => {
         }
 
         if (payload.type === 'room_transcript' || (payload.type === 'transcript' && (payload.room_id || payload.roomId))) {
-          // If this is a plain 'transcript' with room metadata, ignore messages from self to avoid duplicating local transcripts
-          if (payload.type === 'transcript') {
-            const pid = payload.peer_id || payload.peerId || null;
-            if (typeof pid === 'string' && _peerId.value && pid === _peerId.value) {
-              return;
-            }
+          // Ignore any room-bound message that originated from our own peer_id to avoid self-echo duplicates
+          const pid = payload.peer_id || payload.peerId || null;
+          if (typeof pid === 'string' && _peerId.value && pid === _peerId.value) {
+            return;
           }
           const candidate = String(payload.fullText || payload.text || '').trim();
           if (!candidate || isHallucinationText(candidate)) {
@@ -227,6 +235,10 @@ export const useRoomManager = () => {
 
   const joinRoom = async (id: string, pid?: string, plabel?: string): Promise<void> => {
     roomId.value = id;
+    // Ensure a stable peerId exists
+    if (!pid && !peerId.value) {
+      pid = createPeerId();
+    }
     if (pid) peerId.value = pid;
     if (plabel) peerLabel.value = plabel;
     sendJson({ type: 'join_room', room_id: id, peer_id: peerId.value, peer_label: peerLabel.value });
