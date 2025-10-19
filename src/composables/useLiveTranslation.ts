@@ -25,6 +25,7 @@ import type {
 } from "../types/conversation";
 import { normalizeTranslationMap } from "../utils/translation";
 import { useRoomManager } from './useRoomManager';
+import { isHallucinationText } from "../utils/hallucinations";
 
 interface FinalTranscriptPayload {
   fullText?: string;
@@ -224,6 +225,11 @@ export const useLiveTranslation = () => {
       channel,
       { text, language, fullText, isFinal, translations },
     ) => {
+      // Filter hallucinated outputs like '.' or known watermark phrases
+      const candidate = (fullText || text || '').trim();
+      if (!candidate || isHallucinationText(candidate)) {
+        return;
+      }
       if (language) {
         channel.detectedLanguage = language;
       }
@@ -800,6 +806,11 @@ export const useLiveTranslation = () => {
     () => {
       const latest = room.transcripts[room.transcripts.length - 1];
       if (!latest) return;
+      // Guard again: skip hallucinated items
+      const candidate = (latest.fullText || latest.text || '').trim();
+      if (!candidate || isHallucinationText(candidate)) {
+        return;
+      }
       // Create or find a virtual room channel for the peer if needed
       const label = (latest.peerLabel || `Peer ${latest.peerId?.slice(0, 4) ?? ''}`).trim();
       // Prefer a stable key: channelId if provided, else peerId, else room-scoped fallback

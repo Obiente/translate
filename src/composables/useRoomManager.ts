@@ -1,4 +1,5 @@
 import { ref, reactive, onUnmounted } from 'vue';
+import { isHallucinationText } from '../utils/hallucinations';
 
 export interface RoomTranscript {
   roomId: string;
@@ -135,6 +136,10 @@ export const useRoomManager = () => {
             if (typeof pid === 'string' && _peerId.value && pid === _peerId.value) {
               return;
             }
+          }
+          const candidate = String(payload.fullText || payload.text || '').trim();
+          if (!candidate || isHallucinationText(candidate)) {
+            return;
           }
           const entry: RoomTranscript = {
             roomId: payload.room_id || payload.roomId,
