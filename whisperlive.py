@@ -957,6 +957,7 @@ app = FastAPI(title="WhisperLive Server", version="1.0.0")
 # Track connections and room membership
 ROOMS: Dict[str, Set[WebSocket]] = {}
 CONNECTION_INFO: Dict[WebSocket, Dict[str, Optional[str]]] = {}
+CONNECTION_LAST_SEEN: Dict[WebSocket, float] = {}
 ROOM_LOCK = asyncio.Lock()
 
 
@@ -974,6 +975,8 @@ def _normalize_room_fields(message: Dict[str, object]) -> Tuple[Optional[str], O
 async def _add_to_room(ws: WebSocket, room_id: str, peer_id: Optional[str], peer_label: Optional[str]) -> None:
     changed = False
     async with ROOM_LOCK:
+        # touch last seen
+        CONNECTION_LAST_SEEN[ws] = time.monotonic()
         # Previous state
         prev = CONNECTION_INFO.get(ws)
         prev_room = prev.get("room_id") if prev else None
@@ -1015,6 +1018,7 @@ async def _add_to_room(ws: WebSocket, room_id: str, peer_id: Optional[str], peer
 
 async def _leave_room(ws: WebSocket) -> None:
     async with ROOM_LOCK:
+        CONNECTION_LAST_SEEN[ws] = time.monotonic()
         info = CONNECTION_INFO.get(ws)
         if not info:
             return
@@ -1040,6 +1044,7 @@ async def _leave_room(ws: WebSocket) -> None:
 async def _remove_connection(ws: WebSocket) -> None:
     async with ROOM_LOCK:
         info = CONNECTION_INFO.pop(ws, None)
+        CONNECTION_LAST_SEEN.pop(ws, None)
         room_id = info.get("room_id") if info else None
         if room_id and room_id in ROOMS:
             ROOMS[room_id].discard(ws)
@@ -1106,13 +1111,47 @@ async def _broadcast_room_transcript(ws: WebSocket, payload: Dict[str, object], 
         "channel_id": channel_id,
         "sequence": sequence,
     })
+    sender_peer = meta.get("peer_id")
     for s in sockets:
+        # Skip sender socket
         if s is ws:
+            continue
+        # Also skip other sockets belonging to the same peer (avoid echoing to own room socket)
+        s_meta = CONNECTION_INFO.get(s) or {}
+        if sender_peer and s_meta.get("peer_id") == sender_peer:
             continue
         try:
             await s.send_json(out)
         except Exception:
             continue
+
+
+# Idle room member cleanup
+ROOM_MEMBER_IDLE_TIMEOUT = _env_float("ROOM_MEMBER_IDLE_TIMEOUT", 70.0)
+ROOM_CLEANUP_INTERVAL = _env_float("ROOM_CLEANUP_INTERVAL", 15.0)
+
+
+async def _room_cleanup_loop() -> None:  # pragma: no cover - background maintenance
+    try:
+        while True:
+            await asyncio.sleep(ROOM_CLEANUP_INTERVAL)
+            now = time.monotonic()
+            stale: List[WebSocket] = []
+            async with ROOM_LOCK:
+                for ws, ts in list(CONNECTION_LAST_SEEN.items()):
+                    if (now - ts) > ROOM_MEMBER_IDLE_TIMEOUT:
+                        stale.append(ws)
+            for ws in stale:
+                try:
+                    await _remove_connection(ws)
+                except Exception:
+                    pass
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+    except asyncio.CancelledError:
+        return
 
 
 @app.on_event("shutdown")
@@ -1123,6 +1162,12 @@ async def shutdown_event() -> None:
             await _translation_client.aclose()
         finally:
             _translation_client = None
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    # Start background cleanup task for idle room members
+    asyncio.create_task(_room_cleanup_loop())
 
 
 @app.post("/transcribe")
@@ -1190,10 +1235,22 @@ async def websocket_transcribe(websocket: WebSocket):
             message_type = (message.get("type") or "").lower()
 
             if message_type == "ping":
+                # Update last-seen for idle cleanup
+                try:
+                    async with ROOM_LOCK:
+                        CONNECTION_LAST_SEEN[websocket] = time.monotonic()
+                except Exception:
+                    pass
                 await websocket.send_json({"type": "pong", "ts": message.get("ts")})
                 continue
 
             if message_type == "start":
+                # Touch last-seen
+                try:
+                    async with ROOM_LOCK:
+                        CONNECTION_LAST_SEEN[websocket] = time.monotonic()
+                except Exception:
+                    pass
                 if session is not None:
                     try:
                         await session.close()
@@ -1230,6 +1287,12 @@ async def websocket_transcribe(websocket: WebSocket):
                 continue
 
             if message_type == "chunk":
+                # Touch last-seen
+                try:
+                    async with ROOM_LOCK:
+                        CONNECTION_LAST_SEEN[websocket] = time.monotonic()
+                except Exception:
+                    pass
                 if session is None:
                     await websocket.send_json({"type": "error", "detail": "Session not started"})
                     continue
