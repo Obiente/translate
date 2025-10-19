@@ -1,5 +1,9 @@
 <template>
-  <div class="spotify-lyrics-display" ref="containerRef">
+  <div
+    class="spotify-lyrics-display"
+    ref="containerRef"
+    :style="containerStyle"
+  >
     <!-- All sentences with typing animation -->
     <div
       v-for="(sentence, idx) in allSentences"
@@ -53,7 +57,7 @@
     </div>
 
     <!-- Bottom section with speaker chip and original text (fixed at bottom) -->
-    <div class="bottom-info">
+  <div class="bottom-info" ref="bottomInfoRef">
       <div
         class="full-screen-participants-bar"
         v-if="props.speakingChannels.length"
@@ -93,7 +97,14 @@
 </template>
 
 <script setup lang="ts">
-  import { ref, computed, watch, nextTick, onUnmounted } from "vue";
+  import {
+    ref,
+    computed,
+    watch,
+    nextTick,
+    onUnmounted,
+    onMounted,
+  } from "vue";
   import ParticipantChip from "./ParticipantChip.vue";
 
   interface SegmentInput {
@@ -116,6 +127,12 @@
     speakingChannels?: Array<{ id: string; label: string }>; // Currently speaking participants
     // When true, always show speaker initials/avatar regardless of unique speaker count
     alwaysShowInitials?: boolean;
+    // Top padding as viewport height percentage to bias for more history visibility
+    topPadVh?: number;
+    // Auto-scroll only when near bottom; set false to disable auto pinning
+    autoscroll?: boolean;
+    // Distance from bottom in pixels considered "pinned"
+    pinThresholdPx?: number;
   }
 
   const props = withDefaults(defineProps<Props>(), {
@@ -129,9 +146,16 @@
     segments: () => [] as SegmentInput[],
     speakingChannels: () => [] as Array<{ id: string; label: string }>,
     alwaysShowInitials: false,
+    topPadVh: 35, // show more history than the previous 50vh default
+    autoscroll: true,
+    pinThresholdPx: 120,
   });
 
   const containerRef = ref<HTMLElement | null>(null);
+  const bottomInfoRef = ref<HTMLElement | null>(null);
+  const bottomInfoHeight = ref(200); // fallback padding for bottom overlay
+  const isPinned = ref(true); // whether user is near the bottom (auto-scroll enabled)
+  const hasUserScrolled = ref(false);
 
   // Store sentences with their displayed text
   interface SentenceDisplay {
@@ -174,6 +198,16 @@
   const hasPerSentenceSpeakers = computed(() =>
     allSentences.value.some((s) => !!s.speaker)
   );
+
+  // Dynamic container padding to avoid bottom overlay overlap and allow longer history
+  const containerStyle = computed(() => {
+    const topPad = `${props.topPadVh}vh`;
+    const sidePad = `1rem`;
+    const bottomPad = `${Math.max(bottomInfoHeight.value + 32, 160)}px`;
+    return {
+      padding: `${topPad} ${sidePad} ${bottomPad} ${sidePad}`,
+    } as Record<string, string>;
+  });
 
   // Only show initials if there is more than one unique speaker in the recent window
   // Focus on visible/active context: last few sentences that have some displayed text
@@ -492,27 +526,78 @@
       clearInterval(typingInterval.value);
       typingInterval.value = null;
     }
+    if (resizeObs) {
+      resizeObs.disconnect();
+      resizeObs = null;
+    }
+    // detach scroll listener
+    if (containerRef.value && onScrollBound) {
+      containerRef.value.removeEventListener("scroll", onScrollBound);
+      onScrollBound = null;
+    }
   });
 
   // Auto-scroll current sentence to keep it centered
+  const scrollToCurrent = (behavior: ScrollBehavior = "smooth") => {
+    if (!containerRef.value || allSentences.value.length === 0) return;
+    const allLines = containerRef.value.querySelectorAll(".lyrics-line");
+    const lastLine = allLines[allLines.length - 1] as HTMLElement | undefined;
+    if (!lastLine) return;
+    lastLine.scrollIntoView({ behavior, block: "center", inline: "center" });
+  };
+
   watch(
     () => allSentences.value.length,
-    async () => {
+    async (newLen, oldLen) => {
       await nextTick();
-      // Always scroll to the last sentence (the current one)
-      if (allSentences.value.length > 0 && containerRef.value) {
-        const allLines = containerRef.value.querySelectorAll(".lyrics-line");
-        const lastLine = allLines[allLines.length - 1];
-        if (lastLine) {
-          lastLine.scrollIntoView({
-            behavior: "smooth",
-            block: "center",
-            inline: "center",
-          });
-        }
+      // Only auto-scroll when pinned or on first initialize
+      if (!props.autoscroll) return;
+      if (!hasInitialized.value || isPinned.value) {
+        scrollToCurrent(newLen - (oldLen ?? 0) > 1 ? "auto" : "smooth");
       }
     }
   );
+
+  // Track whether user is near the bottom to control auto-scroll
+  let onScrollBound: ((e: Event) => void) | null = null;
+  const onScroll = () => {
+    const el = containerRef.value;
+    if (!el) return;
+    const { scrollTop, scrollHeight, clientHeight } = el;
+    const distanceFromBottom = scrollHeight - (scrollTop + clientHeight);
+    const pinned = distanceFromBottom <= (props.pinThresholdPx ?? 120);
+    // When user scrolls manually away from bottom, we stop auto-scrolling
+    hasUserScrolled.value = true;
+    isPinned.value = pinned;
+  };
+
+  // Observe bottom overlay height to set bottom padding dynamically
+  let resizeObs: ResizeObserver | null = null;
+  onMounted(() => {
+    // Attach scroll listener
+    if (containerRef.value) {
+      onScrollBound = onScroll.bind(null);
+      containerRef.value.addEventListener("scroll", onScrollBound);
+      // Initial pin state
+      onScroll();
+    }
+    // Measure bottom overlay
+    if (bottomInfoRef.value && "ResizeObserver" in window) {
+      resizeObs = new ResizeObserver((entries) => {
+        for (const entry of entries) {
+          const box = entry.contentRect;
+          bottomInfoHeight.value = Math.round(box.height);
+        }
+      });
+      resizeObs.observe(bottomInfoRef.value);
+      // Initial measure
+      bottomInfoHeight.value = Math.round(
+        bottomInfoRef.value.getBoundingClientRect().height
+      );
+    }
+    // Ensure current line is visible on first mount
+    nextTick(() => scrollToCurrent("auto"));
+  });
 
   // Current sentence's original text for overlay
   const currentOriginalText = computed(() => {
