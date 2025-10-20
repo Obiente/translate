@@ -7,6 +7,7 @@ import type { WhisperTranscriberManager } from "./useWhisperTranscriber";
 import { watch } from "vue";
 import { normalizeTranslationMap } from "../../utils/translation";
 import { useRoomManager } from "../useRoomManager";
+import { filterAudioChunk, getDefaultFilterConfig } from "../../utils/audioFilters";
 const DEFAULT_CHUNK_INTERVAL_MS = 300;
 const DEFAULT_KEEPALIVE_INTERVAL_MS = 5000;
 const DEFAULT_KEEPALIVE_TIMEOUT_MS = 45000;
@@ -443,8 +444,28 @@ export const useStreamingWhisperTranscriber = (
                 return;
             }
 
+            // Apply VAD and noise gate filtering - skip sending if no voice activity
+            let filteredBuffer: Float32Array = combinedBuffer;
+            if (!isFinal && combinedBuffer.length > 0) {
+                const filterConfig = getDefaultFilterConfig(state.sampleRate);
+                const filtered = filterAudioChunk(
+                    combinedBuffer,
+                    filterConfig.vad,
+                    filterConfig.gate
+                );
+                
+                // If no voice activity detected, skip sending this chunk
+                if (filtered === null) {
+                    console.log('[VAD] Silence detected, skipping chunk');
+                    return;
+                }
+                
+                console.log('[VAD] Voice activity detected, sending chunk');
+                filteredBuffer = new Float32Array(filtered);
+            }
+
             // Convert to WAV
-            const pcmData = float32ToInt16(combinedBuffer);
+            const pcmData = float32ToInt16(filteredBuffer);
             const wavBuffer = createWavChunk(pcmData, state.sampleRate);
             const wavBlob = new Blob([wavBuffer], { type: "audio/wav" });
 
