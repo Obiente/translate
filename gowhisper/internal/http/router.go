@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/obiente/translate/server-go/internal/config"
-	"github.com/obiente/translate/server-go/internal/ws"
+	"github.com/obiente/translate/gowhisper/internal/config"
+	"github.com/obiente/translate/gowhisper/internal/ws"
 )
 
 func NewRouter() http.Handler {

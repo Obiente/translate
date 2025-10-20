@@ -13,10 +13,10 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/rs/zerolog/log"
 
-	"github.com/obiente/translate/server-go/internal/audio"
-	"github.com/obiente/translate/server-go/internal/config"
-	"github.com/obiente/translate/server-go/internal/translation"
-	weng "github.com/obiente/translate/server-go/internal/whisper"
+	"github.com/obiente/translate/gowhisper/internal/audio"
+	"github.com/obiente/translate/gowhisper/internal/config"
+	"github.com/obiente/translate/gowhisper/internal/translation"
+	weng "github.com/obiente/translate/gowhisper/internal/whisper"
 )
 
 // min returns the minimum of two integers (Go 1.21+)

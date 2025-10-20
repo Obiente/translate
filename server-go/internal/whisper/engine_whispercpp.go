@@ -146,8 +146,7 @@ func (e *EngineCPP) Stream(samples []float32, onSegment func(text string, lang s
 		samples = samples[len(samples)-contextSamples:]
 	}
 
-	var ctx whisperpkg.Context
-	ctx, err = e.model.NewContext()
+	ctx, err := e.model.NewContext()
 	if err != nil {
 		return fmt.Errorf("create context: %w", err)
 	}
@@ -226,8 +225,7 @@ func (e *EngineCPP) Process(samples []float32) (delta, full, lang string, err er
 	}
 
 	// Create a new context for each processing call
-	var ctx whisperpkg.Context
-	ctx, err = e.model.NewContext()
+	ctx, err := e.model.NewContext()
 	if err != nil {
 		return "", "", "", fmt.Errorf("create context: %w", err)
 	}
@@ -250,12 +248,12 @@ func (e *EngineCPP) Process(samples []float32) (delta, full, lang string, err er
 	// Collect all segments
 	var segments []string
 	for {
-		seg, newErr := ctx.NextSegment()
-		if newErr != nil {
-			if newErr == io.EOF {
+		seg, err := ctx.NextSegment()
+		if err != nil {
+			if err == io.EOF {
 				break
 			}
-			log.Warn().Err(newErr).Msg("whisper: error reading segment")
+			log.Warn().Err(err).Msg("whisper: error reading segment")
 			break
 		}
 
@@ -267,9 +265,11 @@ func (e *EngineCPP) Process(samples []float32) (delta, full, lang string, err er
 	}
 
 	// Build full transcription
+	full := strings.Join(segments, " ")
 	full = strings.TrimSpace(full)
 
 	// Get detected language
+	lang := ctx.Language()
 	if lang == "" {
 		lang = ctx.DetectedLanguage()
 	}

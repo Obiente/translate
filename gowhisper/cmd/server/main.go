@@ -8,8 +8,8 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
-	"github.com/obiente/translate/server-go/internal/config"
-	serverhttp "github.com/obiente/translate/server-go/internal/http"
+	"github.com/obiente/translate/gowhisper/internal/config"
+	serverhttp "github.com/obiente/translate/gowhisper/internal/http"
 )
 
 func main() {

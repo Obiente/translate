@@ -37,8 +37,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Cache go modules first
-COPY server-go/go.mod server-go/go.sum ./server-go/
-RUN cd server-go && go mod download
+COPY gowhisper/go.mod gowhisper/go.sum ./gowhisper/
+RUN cd gowhisper && go mod download
 
 # Bring in full source
 COPY . .
@@ -53,7 +53,7 @@ ENV CGO_CPPFLAGS="-I/opt/whisper/include"
 ENV CGO_LDFLAGS="-L/opt/whisper/lib -lwhisper -lggml -lggml-base -lggml-cpu -lstdc++ -lm -pthread -Wl,-rpath,/usr/local/lib"
 
 # Build the server with whisper.cpp support
-RUN cd server-go && go build -tags whisper_cpp -o /out/whisper-server ./cmd/server
+RUN cd gowhisper && go build -tags whisper_cpp -o /out/whisper-server ./cmd/server
 
 
 # --- Stage 3: (optional) Model download stage for better caching ---

@@ -1,4 +1,4 @@
-module github.com/obiente/translate/server-go
+module github.com/obiente/translate/gowhisper
 
 go 1.23
 
