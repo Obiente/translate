@@ -544,7 +544,7 @@
   // Watch for streaming state changes
   watch(
     () => [props.streaming, props.isFinal] as const,
-    ([streaming, isFinal]: [boolean, boolean]) => {
+    ([streaming, isFinal]: readonly [boolean, boolean]) => {
       // Clear existing interval
       if (typingInterval.value !== null) {
         clearInterval(typingInterval.value);
