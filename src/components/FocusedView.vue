@@ -245,7 +245,7 @@
 
   const activeChannelsWithContent = computed(() =>
     props.channels.filter(
-      (c) =>
+      (c: Channel) =>
         c.isActive &&
         (c.liveTranscript || Object.keys(c.liveTranslations).length)
     )
@@ -255,7 +255,7 @@
   // do not lose context during longer conversations.
   const recentHistoryWithTranslations = computed(() =>
     props.recentHistory
-      .filter((entry) => Object.keys(entry.translations).length > 0)
+      .filter((entry: HistoryEntry) => Object.keys(entry.translations).length > 0)
       .slice(0, 20)
   );
 
@@ -268,9 +268,9 @@
   const room = useRoomManager();
   const participants = computed(() => {
     const map = new Map<string, { id: string; label: string; sourceType: 'channel' | 'room' }>();
-    const hasLocalActive = props.channels.some((c) => c.isActive && (c as any).sourceType !== 'room');
+    const hasLocalActive = props.channels.some((c: Channel) => c.isActive && (c as any).sourceType !== 'room');
     // Helper: does a channel exist with given id (covers synthetic room channels too)
-    const hasChannelId = (id: string) => props.channels.some((c) => c.id === id && c.isActive);
+    const hasChannelId = (id: string) => props.channels.some((c: Channel) => c.id === id && c.isActive);
 
     // Active channels (include both microphone/system and synthetic 'room' channels)
     for (const c of props.channels) {
@@ -308,7 +308,7 @@
     const segs: Segment[] = [];
 
     // Build quick lookup for channels by id
-    const channelById = new Map(props.channels.map((c) => [c.id, c] as const));
+    const channelById = new Map<string, Channel>(props.channels.map((c: Channel) => [c.id, c]));
 
     // History first (already finalized), sorted by timestamp ascending
     const history = [...recentHistoryWithTranslations.value].sort(
@@ -341,6 +341,9 @@
       });
     }
 
+    // Collect already-seen translated texts from history to deduplicate live
+    const historyTexts = new Set(segs.map((s) => s.text));
+
     // Live segments (one per channel), placed at the end as the most recent
     for (const ch of props.channels) {
       const preferred = Array.isArray(ch.targetLanguages) ? ch.targetLanguages : [];
@@ -356,6 +359,9 @@
       if (!chosen) continue; // No server translation yet — do not show original/liveTranscript
       const text = (chosen.primary || chosen.alternatives?.[0] || "").trim();
       if (!text) continue;
+      // Skip live segments whose translation already appears in history —
+      // this prevents the brief duplicate flash during live→history transition.
+      if (historyTexts.has(text)) continue;
       segs.push({
         id: `l-${ch.id}`,
         text,
@@ -372,7 +378,7 @@
         new Date(b.timestamp || 0).getTime()
     );
 
-    const anyActive = props.channels.some((c) => c.isActive && !c.isFinal);
+    const anyActive = props.channels.some((c: Channel) => c.isActive && !c.isFinal);
     return {
       segments: segs,
       streaming: anyActive,

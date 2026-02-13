@@ -12,10 +12,10 @@
         'lyrics-line',
         {
           completed:
-            idx < allSentences.length - 1 &&
+            Number(idx) < allSentences.length - 1 &&
             sentence.displayed === sentence.full,
           current:
-            idx === allSentences.length - 1 ||
+            Number(idx) === allSentences.length - 1 ||
             sentence.displayed !== sentence.full,
         },
       ]"
@@ -197,7 +197,7 @@
   const typingInterval = ref<number | null>(null);
   const hasInitialized = ref(false); // Track if we've done the initial load
   const hasPerSentenceSpeakers = computed(() =>
-    allSentences.value.some((s) => !!s.speaker)
+    allSentences.value.some((s: SentenceDisplay) => !!s.speaker)
   );
 
   // Dynamic container padding to avoid bottom overlay overlap and allow longer history
@@ -215,7 +215,7 @@
   const showInitials = computed(() => {
     if (props.alwaysShowInitials) return true;
     let recent = allSentences.value.filter(
-      (s) => (s.displayed?.length ?? 0) > 0
+      (s: SentenceDisplay) => (s.displayed?.length ?? 0) > 0
     );
     if (recent.length === 0 && allSentences.value.length > 0) {
       // Nothing displayed yet: consider the latest sentence (current line)
@@ -313,7 +313,7 @@
     }> = [];
     const segs = Array.isArray(props.segments) ? props.segments : [];
     if (segs.length > 0) {
-      segs.forEach((seg, segIndex) => {
+      segs.forEach((seg: SegmentInput, segIndex: number) => {
         const baseId = seg.id || `seg-${segIndex}`;
         const parts = splitIntoSentences(seg.text || "");
         if (parts.length === 0 && (seg.text || "").trim().length) {
@@ -379,7 +379,9 @@
     }));
 
     // Diff with existing by id to preserve progress
-    const oldById = new Map(allSentences.value.map((s) => [s.id, s] as const));
+    const oldById = new Map<string, SentenceDisplay>(
+      allSentences.value.map((s: SentenceDisplay) => [s.id, s] as [string, SentenceDisplay])
+    );
 
     for (let i = 0; i < newModels.length; i++) {
       const nm = newModels[i];
@@ -423,76 +425,102 @@
       }
     }
 
-    // Initial load: reveal history, animate last
+    // Always instantly reveal every sentence except the very last one.
+    // Only the last (current) sentence gets the typing animation.
+    // This prevents a visual backlog where many queued sentences must
+    // animate sequentially before the user can see the latest text.
+    for (let i = 0; i < newModels.length - 1; i++) {
+      if (newModels[i].displayed !== newModels[i].full) {
+        newModels[i].displayed = newModels[i].full;
+        newModels[i].isAnimating = false;
+      }
+    }
+
+    // Kick off animation for the last sentence if it isn't complete yet
+    if (newModels.length > 0) {
+      const last = newModels[newModels.length - 1];
+      if (last.displayed !== last.full && !last.isAnimating) {
+        last.isAnimating = true;
+      }
+    }
+
     if (!hasInitialized.value) {
       hasInitialized.value = true;
-      for (let i = 0; i < newModels.length; i++) {
-        newModels[i].displayed =
-          i < newModels.length - 1 ? newModels[i].full : "";
-        newModels[i].isAnimating = i === newModels.length - 1;
-      }
     }
 
     allSentences.value = newModels;
   };
 
-  // Animate typing for incomplete sentences
+  // Animate typing for the current (last) sentence.
+  // Uses adaptive speed: large text gaps catch up quickly so completed
+  // translations appear almost instantly, while small incremental arrivals
+  // keep the smooth typewriter feel.
+  let lastAnimScrollTime = 0;
+
+  // Lightweight scroll nudge during animation — uses instant scrollTop
+  // assignment so it never conflicts with ongoing smooth scrolls.
+  const nudgeScroll = () => {
+    if (!props.autoscroll || !isPinned.value) return;
+    const now = Date.now();
+    if (now - lastAnimScrollTime < 200) return; // throttle to ~5 Hz
+    lastAnimScrollTime = now;
+    const el = containerRef.value;
+    if (!el) return;
+    const allLines = el.querySelectorAll(".lyrics-line");
+    const lastLine = allLines[allLines.length - 1] as HTMLElement | undefined;
+    if (!lastLine) return;
+    isAutoScrolling = true;
+    lastLine.scrollIntoView({ behavior: "auto", block: "center" });
+    requestAnimationFrame(() => {
+      isAutoScrolling = false;
+    });
+  };
+
   const animateTyping = () => {
     if (allSentences.value.length === 0) return;
 
-    // Find the first sentence that is currently animating or needs animation
-    let foundAnimating = false;
-
+    // Only the last sentence should ever be animating (earlier ones are
+    // force-revealed in updateSentences), but scan defensively.
     for (let i = 0; i < allSentences.value.length; i++) {
       const sentence = allSentences.value[i];
 
-      // If we found a sentence that's animating or incomplete
       if (sentence.isAnimating && sentence.displayed !== sentence.full) {
-        // Continue animating this sentence
+        const gap = sentence.full.length - sentence.displayed.length;
+        // Adaptive: large gap → reveal in ~8 ticks (~240 ms); small gap → 1 char
+        const charsPerTick = gap > 30 ? Math.ceil(gap / 8) : 1;
         const nextLength = Math.min(
-          sentence.displayed.length + 1,
+          sentence.displayed.length + charsPerTick,
           sentence.full.length
         );
         sentence.displayed = sentence.full.substring(0, nextLength);
 
-        // If this sentence is done animating
         if (sentence.displayed === sentence.full) {
           sentence.isAnimating = false;
-
-          // Start animating the next sentence if it exists and is not complete
-          if (i + 1 < allSentences.value.length) {
-            const nextSentence = allSentences.value[i + 1];
-            if (nextSentence.displayed !== nextSentence.full) {
-              nextSentence.isAnimating = true;
-            }
-          }
         }
-
-        foundAnimating = true;
-        break;
+        nudgeScroll();
+        return;
       }
     }
 
-    // If no sentence is currently animating, start the first incomplete one
-    if (!foundAnimating) {
-      for (let i = 0; i < allSentences.value.length; i++) {
-        const sentence = allSentences.value[i];
-        if (sentence.displayed !== sentence.full) {
-          sentence.isAnimating = true;
+    // No sentence currently animating — start the first incomplete one
+    for (let i = 0; i < allSentences.value.length; i++) {
+      const sentence = allSentences.value[i];
+      if (sentence.displayed !== sentence.full) {
+        sentence.isAnimating = true;
 
-          // Animate one character
-          const nextLength = Math.min(
-            sentence.displayed.length + 1,
-            sentence.full.length
-          );
-          sentence.displayed = sentence.full.substring(0, nextLength);
+        const gap = sentence.full.length - sentence.displayed.length;
+        const charsPerTick = gap > 30 ? Math.ceil(gap / 8) : 1;
+        const nextLength = Math.min(
+          sentence.displayed.length + charsPerTick,
+          sentence.full.length
+        );
+        sentence.displayed = sentence.full.substring(0, nextLength);
 
-          // If immediately complete, mark as not animating
-          if (sentence.displayed === sentence.full) {
-            sentence.isAnimating = false;
-          }
-          break;
+        if (sentence.displayed === sentence.full) {
+          sentence.isAnimating = false;
         }
+        nudgeScroll();
+        return;
       }
     }
   };
@@ -516,7 +544,7 @@
   // Watch for streaming state changes
   watch(
     () => [props.streaming, props.isFinal] as const,
-    ([streaming, isFinal]) => {
+    ([streaming, isFinal]: [boolean, boolean]) => {
       // Clear existing interval
       if (typingInterval.value !== null) {
         clearInterval(typingInterval.value);
@@ -543,6 +571,10 @@
       clearInterval(typingInterval.value);
       typingInterval.value = null;
     }
+    if (isAutoScrollTimer) {
+      clearTimeout(isAutoScrollTimer);
+      isAutoScrollTimer = null;
+    }
     if (resizeObs) {
       resizeObs.disconnect();
       resizeObs = null;
@@ -555,25 +587,30 @@
   });
 
   // Auto-scroll current sentence to keep it centered
+  let isAutoScrollTimer: ReturnType<typeof setTimeout> | null = null;
   const scrollToCurrent = (behavior: ScrollBehavior = "smooth") => {
     if (!containerRef.value || allSentences.value.length === 0) return;
     const allLines = containerRef.value.querySelectorAll(".lyrics-line");
     const lastLine = allLines[allLines.length - 1] as HTMLElement | undefined;
     if (!lastLine) return;
-    // Flag so the onScroll handler ignores this programmatic scroll
+    // Flag so the onScroll handler ignores scroll events from this call.
+    // We also force isPinned = true because we are explicitly scrolling to
+    // the latest content — prevents a stale false from blocking future scrolls.
     isAutoScrolling = true;
+    isPinned.value = true;
     lastLine.scrollIntoView({ behavior, block: "center", inline: "center" });
-    // Clear flag after the scroll settles (two rAF frames for smooth scrolls)
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        isAutoScrolling = false;
-      });
-    });
+    // Smooth scrolling takes 300-500 ms — keep the guard up long enough.
+    if (isAutoScrollTimer) clearTimeout(isAutoScrollTimer);
+    const clearDelay = behavior === "smooth" ? 500 : 60;
+    isAutoScrollTimer = setTimeout(() => {
+      isAutoScrolling = false;
+      isAutoScrollTimer = null;
+    }, clearDelay);
   };
 
   watch(
     () => allSentences.value.length,
-    async (newLen, oldLen) => {
+    async (newLen: number, oldLen: number | undefined) => {
       await nextTick();
       // Only auto-scroll when pinned or on first initialize
       if (!props.autoscroll) return;
@@ -589,7 +626,7 @@
   watch(
     () => {
       const segs = Array.isArray(props.segments) ? props.segments : [];
-      return segs.map((s) => s.text).join("|");
+      return segs.map((s: SegmentInput) => s.text).join("|");
     },
     async () => {
       if (!props.autoscroll || !isPinned.value) return;
