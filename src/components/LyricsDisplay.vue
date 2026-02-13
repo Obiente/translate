@@ -156,6 +156,7 @@
   const bottomInfoHeight = ref(200); // fallback padding for bottom overlay
   const isPinned = ref(true); // whether user is near the bottom (auto-scroll enabled)
   const hasUserScrolled = ref(false);
+  let isAutoScrolling = false; // flag to ignore scroll events triggered by programmatic scrolls
 
   // Store sentences with their displayed text
   interface SentenceDisplay {
@@ -400,9 +401,25 @@
           }
         }
       } else {
-        // New sentence starts hidden (will animate in order)
-        nm.displayed = "";
-        nm.isAnimating = false;
+        // No ID match — check if an existing sentence has matching text.
+        // This handles live→history transitions where the segment ID changes
+        // (e.g. "l-channel" → "h-uuid") but the text content is identical,
+        // preventing a visible flash/jump when the sentence re-animates.
+        let textMatch: SentenceDisplay | undefined;
+        for (const old of allSentences.value) {
+          if (old.full === nm.full && old.displayed === old.full) {
+            textMatch = old;
+            break;
+          }
+        }
+        if (textMatch) {
+          nm.displayed = nm.full;
+          nm.isAnimating = false;
+        } else {
+          // Truly new sentence — starts hidden (will animate in order)
+          nm.displayed = "";
+          nm.isAnimating = false;
+        }
       }
     }
 
@@ -543,7 +560,15 @@
     const allLines = containerRef.value.querySelectorAll(".lyrics-line");
     const lastLine = allLines[allLines.length - 1] as HTMLElement | undefined;
     if (!lastLine) return;
+    // Flag so the onScroll handler ignores this programmatic scroll
+    isAutoScrolling = true;
     lastLine.scrollIntoView({ behavior, block: "center", inline: "center" });
+    // Clear flag after the scroll settles (two rAF frames for smooth scrolls)
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        isAutoScrolling = false;
+      });
+    });
   };
 
   watch(
@@ -558,15 +583,31 @@
     }
   );
 
+  // Also auto-scroll when segment content changes (not just sentence count).
+  // This covers cases where the live segment text grows without adding new
+  // sentences, e.g. words appended to the last line.
+  watch(
+    () => {
+      const segs = Array.isArray(props.segments) ? props.segments : [];
+      return segs.map((s) => s.text).join("|");
+    },
+    async () => {
+      if (!props.autoscroll || !isPinned.value) return;
+      await nextTick();
+      scrollToCurrent("smooth");
+    }
+  );
+
   // Track whether user is near the bottom to control auto-scroll
   let onScrollBound: ((e: Event) => void) | null = null;
   const onScroll = () => {
+    // Skip scroll events triggered by programmatic scrollToCurrent calls
+    if (isAutoScrolling) return;
     const el = containerRef.value;
     if (!el) return;
     const { scrollTop, scrollHeight, clientHeight } = el;
     const distanceFromBottom = scrollHeight - (scrollTop + clientHeight);
     const pinned = distanceFromBottom <= (props.pinThresholdPx ?? 120);
-    // When user scrolls manually away from bottom, we stop auto-scrolling
     hasUserScrolled.value = true;
     isPinned.value = pinned;
   };

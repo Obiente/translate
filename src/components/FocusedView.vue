@@ -251,11 +251,12 @@
     )
   );
 
-  // Get recent history with translations (limit to last 5 entries for Musixmatch-style view)
+  // Get recent history with translations — keep a generous window so users
+  // do not lose context during longer conversations.
   const recentHistoryWithTranslations = computed(() =>
     props.recentHistory
       .filter((entry) => Object.keys(entry.translations).length > 0)
-      .slice(0, 5)
+      .slice(0, 20)
   );
 
   import LyricsDisplay from "./LyricsDisplay.vue";
