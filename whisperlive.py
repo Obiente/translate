@@ -241,6 +241,46 @@ AUTO_FINAL_REPEAT_THRESHOLD = max(_env_int("WHISPERLIVE_AUTO_FINAL_REPEAT_THRESH
 SENTENCE_FINAL_REPEAT_THRESHOLD = max(_env_int("WHISPERLIVE_SENTENCE_FINAL_REPEAT_THRESHOLD", 2), 1)
 
 
+# ---------------------------------------------------------------------------
+# Hallucination / garbage filter (mirrors the frontend hallucinations.ts)
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+_HALLUCINATION_EXACT: Set[str] = {
+    ".", "·", "•", "…", "...", "—", "–", "-",
+    "you", "thank you", "thanks",
+    "thank you for watching",
+    "thanks for watching",
+    "please subscribe",
+    "subtitles by the amara.org community",
+    "subtitles made by dimatorzok",
+    "subtitles by dimatorzok",
+    "dimatorzok",
+}
+
+_HALLUCINATION_RE = _re.compile(
+    r"^(?:"
+    r"(?:thank(?:s| you)[\s.,!]*){2,}"  # repeated "thank you thank you"
+    r"|(?:\.[\s.]*){3,}"                # repeated dots ". . . ."
+    r"|[^\w]{1,4}"                       # very short all-punctuation
+    r")$",
+    _re.IGNORECASE | _re.UNICODE,
+)
+
+
+def _is_hallucination(text: str) -> bool:
+    """Return True if *text* looks like a known Whisper hallucination."""
+    t = " ".join(text.split()).strip().lower()
+    if not t:
+        return True
+    if t in _HALLUCINATION_EXACT:
+        return True
+    if _HALLUCINATION_RE.match(t):
+        return True
+    return False
+
+
 def _detect_device() -> Tuple[str, str]:
     try:
         import torch
@@ -255,33 +295,63 @@ def _detect_device() -> Tuple[str, str]:
 
 
 def _extract_complete_sentences(text: str) -> Tuple[str, str]:
-    """Extract complete sentences from text.
-    
-    Returns:
-        Tuple of (complete_sentences, remaining_text)
+    """Extract complete sentences from *text*.
+
+    Returns a ``(complete, remaining)`` tuple.  ``complete`` contains every
+    sentence whose ending punctuation is followed by at least one more
+    character (so we know the speaker continued).  ``remaining`` is whatever
+    comes after the last such boundary.
+
+    The heuristic intentionally requires trailing content so we never
+    prematurely finalize a sentence that Whisper might still be extending.
     """
     if not text.strip():
         return "", ""
-    
-    # Define sentence-ending punctuation
-    sentence_endings = {'.', '!', '?', '。', '！', '？'}  # Include some common non-English punctuation
-    
-    # Find the last sentence ending
+
+    # Characters that reliably end a sentence.
+    _ENDINGS = frozenset(".!?。！？")
+    # Characters that look like decimals / abbreviations when a period is
+    # sandwiched between digits (e.g. "3.14") — skip these.
+    _DIGITS = frozenset("0123456789")
+
     last_ending_pos = -1
+    length = len(text)
+
     for i, char in enumerate(text):
-        if char in sentence_endings:
-            # Make sure it's not just a decimal number or abbreviation
-            # Simple heuristic: if followed by space and capital letter, it's likely a sentence end
-            if i + 2 < len(text) and text[i + 1] == ' ' and text[i + 2].isupper():
+        if char not in _ENDINGS:
+            continue
+
+        # Skip periods between digits (likely decimals: "3.14")
+        if char == '.' and i > 0 and i + 1 < length:
+            if text[i - 1] in _DIGITS and text[i + 1] in _DIGITS:
+                continue
+
+        # CJK full-width endings (。！？) are unambiguous sentence enders
+        # whenever something follows.
+        if char in '。！？':
+            if i + 1 < length:
                 last_ending_pos = i
-            elif i == len(text) - 1:  # End of text
-                last_ending_pos = i
-    
+            continue
+
+        # For Latin punctuation (.!?) accept as sentence end when:
+        #   - followed by whitespace + any character (not just uppercase)
+        #   - followed by a quote/bracket then whitespace
+        if i + 1 < length:
+            next_char = text[i + 1]
+            if next_char in (' ', '\n', '\t'):
+                # There must be content after the space to be sure the
+                # speaker continued (guards against trailing ". ")
+                if i + 2 < length:
+                    last_ending_pos = i
+            elif next_char in ('"', "'", '\u201d', '\u2019', ')', ']'):
+                if i + 2 < length and text[i + 2] in (' ', '\n', '\t'):
+                    last_ending_pos = i + 1  # include the closing quote
+
     if last_ending_pos >= 0:
         complete = text[:last_ending_pos + 1].strip()
         remaining = text[last_ending_pos + 1:].strip()
         return complete, remaining
-    
+
     return "", text
 
 
@@ -583,14 +653,35 @@ class WhisperLiveStreamSession:
                 pass
 
     async def _processing_loop(self) -> None:
+        """Process incoming audio, running inference when enough has accumulated.
+
+        A periodic timeout ensures that even if audio stops arriving (the
+        speaker pauses) the loop still wakes up to re-run inference and
+        potentially auto-finalize a stale transcript.
+        """
+        _IDLE_POLL_SECONDS = 1.5  # wake up at least this often
+
         try:
             while True:
-                await self.new_audio_event.wait()
+                try:
+                    await asyncio.wait_for(
+                        self.new_audio_event.wait(),
+                        timeout=_IDLE_POLL_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    pass  # no new audio — still run inference to check for auto-final
                 self.new_audio_event.clear()
                 if self.closed:
                     break
                 try:
                     await self._maybe_run_inference()
+                except RuntimeError as exc:
+                    if "close" in str(exc).lower():
+                        logger.debug("WebSocket closed during inference, stopping loop")
+                        self.closed = True
+                        break
+                    logger.exception("Streaming inference failure: %s", exc)
+                    await self._emit_error(str(exc))
                 except Exception as exc:  # pragma: no cover - defensive
                     logger.exception("Streaming inference failure: %s", exc)
                     await self._emit_error(str(exc))
@@ -600,11 +691,19 @@ class WhisperLiveStreamSession:
             if self.final_future and not self.final_future.done():
                 self.final_future.set_result(None)
 
-    async def _emit_error(self, detail: str) -> None:
+    async def _safe_send_json(self, payload: dict) -> bool:
+        """Send JSON to the client, returning False if the connection is gone."""
+        if self.closed:
+            return False
         try:
-            await self.websocket.send_json({"type": "error", "detail": detail})
-        except Exception:  # pragma: no cover - connection dropped
-            pass
+            await self.websocket.send_json(payload)
+            return True
+        except RuntimeError:
+            self.closed = True
+            return False
+
+    async def _emit_error(self, detail: str) -> None:
+        await self._safe_send_json({"type": "error", "detail": detail})
 
     async def _maybe_run_inference(self) -> None:
         now = time.monotonic()
@@ -621,14 +720,40 @@ class WhisperLiveStreamSession:
         if snapshot.size == 0:
             return
 
+        # First pass: transcribe without translation (fast).
         result = await self.manager.transcribe_array(
             snapshot,
             self.language_hint,
             self.target_languages,
             self.translation_alternative_limit,
             vad_filter=True,
-            translate=True,
+            translate=False,
         )
+
+        # Decide whether the text changed enough to warrant a translation
+        # call.  Finals always get translated; non-finals only when the new
+        # text differs meaningfully from the last translation source.
+        new_text = result.text.strip()
+        need_translation = bool(self.target_languages) and (
+            final_requested
+            or not self.last_translation_source
+            or new_text != self.last_translation_source
+        )
+
+        if need_translation and new_text:
+            translations, detected = await _translate_transcript(
+                new_text,
+                result.language or self.language_hint,
+                self.target_languages,
+                self.translation_alternative_limit,
+            )
+            result = TranscriptionResult(
+                text=result.text,
+                language=detected or result.language,
+                translations=translations,
+                info=result.info,
+                segments=result.segments,
+            )
 
         await self._handle_result(result, final_requested)
 
@@ -636,6 +761,58 @@ class WhisperLiveStreamSession:
         text = result.text.strip()
         if not text and not is_final:
             return
+
+        # Drop known Whisper hallucinations early — saves translation calls
+        # and prevents garbage from reaching any connected client.
+        if _is_hallucination(text) and not is_final:
+            return
+
+        # Strip already-confirmed (finalized) text from the transcription.
+        # After a sentence-level final the buffer retains audio context so
+        # Whisper re-transcribes previously finalized content.  Strip it to
+        # avoid duplication and prevent stale translations overwriting good ones.
+        if self.confirmed_text_prefix:
+            prefix = self.confirmed_text_prefix
+            stripped_prefix = prefix.rstrip()
+            if text.startswith(prefix):
+                text = text[len(prefix):].strip()
+            elif stripped_prefix and text.startswith(stripped_prefix):
+                text = text[len(stripped_prefix):].strip()
+            else:
+                # Whisper may have drifted slightly (changed a word).
+                # Walk backwards through the prefix to find the longest
+                # sub-prefix that still matches — this preserves as much
+                # confirmed context as possible rather than discarding it all.
+                matched = 0
+                for end in range(len(stripped_prefix), 0, -1):
+                    candidate = stripped_prefix[:end]
+                    if text.startswith(candidate):
+                        matched = end
+                        break
+                if matched > 0:
+                    text = text[matched:].strip()
+                    self.confirmed_text_prefix = stripped_prefix[:matched]
+                    logger.debug(
+                        "Partial prefix match",
+                        extra={
+                            "channel_id": self.channel_id,
+                            "original_len": len(prefix),
+                            "matched_len": matched,
+                        },
+                    )
+                else:
+                    # No overlap at all — context drifted completely.
+                    logger.debug(
+                        "Confirmed prefix mismatch, resetting",
+                        extra={
+                            "channel_id": self.channel_id,
+                            "prefix_len": len(prefix),
+                            "text_preview": text[:60],
+                        },
+                    )
+                    self.confirmed_text_prefix = ""
+            if not text and not is_final:
+                return
 
         language = result.language or self.last_language or self.language_hint
         
@@ -670,9 +847,8 @@ class WhisperLiveStreamSession:
                 should_emit_sentence_final = (
                     self.sentence_repeat_count >= SENTENCE_FINAL_REPEAT_THRESHOLD
                     and (now_ts - self.last_emit) >= STREAM_EMIT_INTERVAL
-                    and complete_sentences not in self.confirmed_text_prefix  # Avoid re-emitting
                 )
-                
+
                 if should_emit_sentence_final:
                     logger.debug(
                         "Emitting sentence-level final",
@@ -685,7 +861,14 @@ class WhisperLiveStreamSession:
                     )
                     sentence_final_text = complete_sentences
                     remaining_text = remaining
-                    self.confirmed_text_prefix = complete_sentences
+                    # Accumulate confirmed prefix (tracks total finalized text
+                    # in raw Whisper output terms for prefix stripping).
+                    if self.confirmed_text_prefix:
+                        self.confirmed_text_prefix = (
+                            self.confirmed_text_prefix.rstrip() + " " + complete_sentences
+                        ).strip()
+                    else:
+                        self.confirmed_text_prefix = complete_sentences
                     self.sentence_repeat_count = 0
                     self.last_sentence_beginning = ""
         
@@ -733,13 +916,18 @@ class WhisperLiveStreamSession:
         # Handle sentence-level final emission
         if sentence_final_text and not is_final:
             await self._emit_sentence_final(sentence_final_text, language)
-            # Trim buffer and reset context after sentence final
             await self._reset_context_after_sentence_final()
-            # Continue processing with remaining text for partial updates
+            # If there is no remaining text after the finalized sentences,
+            # return immediately — emitting an empty/duplicate payload would
+            # cause the frontend to show the same sentence twice.
             text = remaining_text
+            if not text:
+                self.last_text = ""
+                self.last_emit = time.monotonic()
+                return
             delta = _compute_delta("", text)  # Reset delta since we finalized previous content
 
-        if not is_final and not delta and not sentence_final_text:
+        if not is_final and not delta:
             logger.debug(
                 "Skipping emit: no delta and not final",
                 extra={"channel_id": self.channel_id, "sequence": self.sequence},
@@ -782,7 +970,8 @@ class WhisperLiveStreamSession:
         }
         if room_id:
             payload.update({"room_id": room_id, "peer_id": peer_id, "peer_label": peer_label})
-        await self.websocket.send_json(payload)
+        if not await self._safe_send_json(payload):
+            return
         # Broadcast to room peers (non-sender) so remote clients receive updates
         if room_id:
             try:
@@ -843,7 +1032,8 @@ class WhisperLiveStreamSession:
         }
         if room_id:
             payload.update({"room_id": room_id, "peer_id": peer_id, "peer_label": peer_label})
-        await self.websocket.send_json(payload)
+        if not await self._safe_send_json(payload):
+            return
         if room_id:
             try:
                 await _broadcast_room_transcript(self.websocket, {
@@ -875,24 +1065,30 @@ class WhisperLiveStreamSession:
                 self.buffer = self.buffer[-self.context_samples:]
 
     async def _reset_context_after_sentence_final(self) -> None:
-        """Reset context after emitting a sentence-level final to prevent buffer growth."""
+        """Reset tracking state after emitting a sentence-level final.
+
+        Uses the standard context window (``context_samples``, ~39 s) instead
+        of an aggressive trim.  Keeping more audio lets Whisper produce stable,
+        consistent output that aligns with ``confirmed_text_prefix`` so
+        subsequent transcriptions don't diverge and overwrite correct
+        translations.
+        """
         async with self.lock:
-            # More aggressive buffer trimming - keep only recent context for next sentence
-            # This prevents unlimited growth during long continuous speech
-            keep_context = max(self.min_samples * 4, int(3.0 * DEFAULT_SAMPLE_RATE))  # Keep ~3 seconds
-            if self.buffer.size > keep_context:
-                self.buffer = self.buffer[-keep_context:]
+            # Use the normal context window — the confirmed_text_prefix
+            # handles deduplication of already-finalized text.
+            if self.context_samples > 0 and self.buffer.size > self.context_samples:
+                self.buffer = self.buffer[-self.context_samples:]
                 logger.debug(
-                    "Context reset after sentence final",
+                    "Context trimmed after sentence final (standard window)",
                     extra={
                         "channel_id": self.channel_id,
                         "new_buffer_size": self.buffer.size,
-                        "keep_context_size": keep_context,
+                        "context_samples": self.context_samples,
                     },
                 )
-            
-            # Reset text tracking for the finalized content
-            self.last_text = ""  # Reset since we finalized previous content
+
+            # Reset text tracking for the new (post-finalization) content
+            self.last_text = ""
             self.repeated_transcript_count = 0
             self.last_repeated_transcript = ""
 
@@ -903,7 +1099,7 @@ class WhisperLiveStreamSession:
             
             # Keep a small amount of recent audio context for next utterance
             # This helps with continuity while preventing unlimited growth
-            keep_recent = max(self.min_samples * 2, int(1.0 * DEFAULT_SAMPLE_RATE))  # Keep ~1 second
+            keep_recent = max(self.min_samples * 4, int(5.0 * DEFAULT_SAMPLE_RATE))  # Keep ~5 seconds
             if self.buffer.size > keep_recent:
                 self.buffer = self.buffer[-keep_recent:]
                 logger.debug(
