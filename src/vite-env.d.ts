@@ -9,6 +9,7 @@ declare module '*.vue' {
 interface ImportMetaEnv {
   readonly VITE_GOOGLE_TRANSLATE_API_KEY?: string
   readonly VITE_GOOGLE_CLOUD_PROJECT_ID?: string
+  readonly VITE_MPEGV_SERVE_URL?: string
 }
 
 interface ImportMeta {

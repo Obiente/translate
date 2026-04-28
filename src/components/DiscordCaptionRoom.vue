@@ -20,6 +20,11 @@
           <span v-if="speakerCount">· {{ speakerCount }} speakers connected</span>
         </p>
       </div>
+      <aside v-if="sessionStatus" class="discord-room__session">
+        <span>Bot session</span>
+        <strong :class="sessionStatus.status">{{ botStatusLabel }}</strong>
+        <small>{{ sessionStatus.status_message || sessionStatus.live_url }}</small>
+      </aside>
     </section>
 
     <section class="discord-room__stage" aria-label="Live translated captions">
@@ -46,7 +51,7 @@
 
       <div class="discord-room__empty" v-if="!speakerCards.length">
         <span class="pulse-ring" aria-hidden="true"></span>
-        <p>Open Discord and start talking in the connected voice channel.</p>
+        <p>{{ emptyStateMessage }}</p>
       </div>
     </section>
 
@@ -68,7 +73,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { useRoomManager, type RoomTranscript } from "../composables/useRoomManager";
 
 const props = defineProps<{
@@ -77,9 +82,35 @@ const props = defineProps<{
 
 const room = useRoomManager();
 const ACTIVE_WINDOW_MS = 5000;
+const SESSION_POLL_MS = 5000;
+const MPEGV_SERVE_BASE = ((import.meta.env.VITE_MPEGV_SERVE_URL as string | undefined)?.trim() || "")
+  .replace(/\/$/, "");
+
+interface TranslationSessionStatus {
+  id: string;
+  live_url?: string;
+  status: "starting" | "connected" | "ready" | "degraded" | "stopped" | "failed" | "stale";
+  status_message?: string;
+  date_updated?: string;
+}
+
+const sessionStatus = ref<TranslationSessionStatus | null>(null);
+const sessionPollError = ref("");
+let sessionPollTimer: number | null = null;
 
 onMounted(async () => {
   await room.joinRoom(props.sessionId, undefined, "Caption viewer");
+  await pollSessionStatus();
+  if (MPEGV_SERVE_BASE) {
+    sessionPollTimer = window.setInterval(pollSessionStatus, SESSION_POLL_MS);
+  }
+});
+
+onUnmounted(() => {
+  if (sessionPollTimer !== null) {
+    clearInterval(sessionPollTimer);
+    sessionPollTimer = null;
+  }
 });
 
 const statusLabel = computed(() => {
@@ -92,6 +123,34 @@ const statusLabel = computed(() => {
 const speakerCount = computed(() =>
   room.members.filter((member) => member.peerLabel !== "Caption viewer").length,
 );
+
+const botStatusLabel = computed(() => {
+  const status = sessionStatus.value?.status;
+  if (status === "ready") return "Receiving audio";
+  if (status === "connected") return "Voice connected";
+  if (status === "degraded") return "Voice degraded";
+  if (status === "stale") return "No heartbeat";
+  if (status === "failed") return "Failed";
+  if (status === "stopped") return "Stopped";
+  return "Starting";
+});
+
+const emptyStateMessage = computed(() => {
+  const status = sessionStatus.value?.status;
+  if (status === "degraded") {
+    return sessionStatus.value?.status_message ||
+      "The bot joined Discord, but the voice connection is not ready yet.";
+  }
+  if (status === "stale") {
+    return "The bot has not reported a heartbeat recently. Try restarting the voice translation session.";
+  }
+  if (status === "failed") {
+    return sessionStatus.value?.status_message || "The bot could not start this voice translation session.";
+  }
+  if (status === "stopped") return "This voice translation session has ended.";
+  if (sessionPollError.value) return sessionPollError.value;
+  return "Open Discord and start talking in the connected voice channel.";
+});
 
 const captions = computed(() =>
   room.transcripts
@@ -178,5 +237,28 @@ function speakerLabel(entry: RoomTranscript): string {
 function initialsFor(label: string): string {
   const parts = label.replace(/[^a-zA-Z0-9\s]/g, " ").trim().split(/\s+/);
   return (parts[0]?.[0] || "S").toUpperCase() + (parts[1]?.[0] || "").toUpperCase();
+}
+
+async function pollSessionStatus(): Promise<void> {
+  if (!MPEGV_SERVE_BASE) return;
+  try {
+    const response = await fetch(
+      `${MPEGV_SERVE_BASE}/translation-sessions/${encodeURIComponent(props.sessionId)}`,
+      {
+        headers: { Accept: "application/json" },
+        cache: "no-store",
+      },
+    );
+    if (!response.ok) {
+      sessionPollError.value = response.status === 404
+        ? "The bot has not registered this session yet."
+        : "Could not read the bot session status.";
+      return;
+    }
+    sessionStatus.value = await response.json() as TranslationSessionStatus;
+    sessionPollError.value = "";
+  } catch {
+    sessionPollError.value = "Could not reach the bot session service.";
+  }
 }
 </script>
