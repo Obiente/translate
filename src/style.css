@@ -1,21 +1,26 @@
 :root {
   /* Typography */
-  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  font-family: "IBM Plex Sans", "Aptos", "Segoe UI", sans-serif;
   line-height: 1.5;
   font-weight: 400;
 
   /* Dark theme palette */
-  --bg: #0f0f0f;
-  --bg-gradient: linear-gradient(135deg, #0f0f0f 0%, #1a1a1a 50%, #0f0f0f 100%);
-  --surface: rgba(255, 255, 255, 0.04);
-  --surface-2: rgba(255, 255, 255, 0.08);
-  --border: rgba(255, 255, 255, 0.08);
-  --text: #e8e8e8;
-  --muted: #b0b0b0;
-  --accent: #1db954; /* Spotify green */
-  --accent-2: #646cff; /* Vite purple */
-  --danger: #ef5350;
-  --success: #48bb78;
+  --bg: #11130f;
+  --bg-gradient:
+    radial-gradient(circle at 18% 0%, rgba(222, 198, 127, 0.14), transparent 30rem),
+    radial-gradient(circle at 92% 18%, rgba(63, 119, 103, 0.18), transparent 28rem),
+    linear-gradient(145deg, #11130f 0%, #191d17 48%, #0c100f 100%);
+  --surface: rgba(246, 238, 214, 0.075);
+  --surface-2: rgba(246, 238, 214, 0.12);
+  --surface-strong: rgba(246, 238, 214, 0.17);
+  --border: rgba(246, 238, 214, 0.14);
+  --text: #f6edd8;
+  --muted: #b8b19f;
+  --accent: #f0c85a;
+  --accent-2: #4fb18d;
+  --danger: #df6b57;
+  --success: #5ed19f;
+  --ink: #141711;
 
   color-scheme: dark;
   color: var(--text);
@@ -53,11 +58,11 @@ html, body {
 
 /* Buttons - global minimal style */
 .button {
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--border);
+  background: rgba(246, 238, 214, 0.08);
   color: inherit;
   padding: 0.5rem 1rem;
-  border-radius: 10px;
+  border-radius: 7px;
   cursor: pointer;
   transition: all 0.2s ease;
   font: inherit;
@@ -71,7 +76,7 @@ html, body {
 }
 
 .button:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.12);
+  background: rgba(246, 238, 214, 0.14);
   transform: translateY(-1px);
 }
 
@@ -85,12 +90,13 @@ html, body {
 }
 
 .button.primary {
-  background: var(--accent-2);
-  border-color: var(--accent-2);
-  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--ink);
+  font-weight: 800;
 }
 
-.button.success { background: var(--success); border-color: var(--success); color: #fff; }
+.button.success { background: var(--success); border-color: var(--success); color: var(--ink); }
 .button.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
 .button.active { background: var(--danger); border-color: var(--danger); color: #fff; }
 
@@ -100,10 +106,10 @@ input[type="text"],
 input[type="search"],
 input[type="number"],
 textarea {
-  background: rgba(0, 0, 0, 0.35);
+  background: rgba(0, 0, 0, 0.24);
   color: inherit;
-  border: 1px solid rgba(255, 255, 255, 0.15);
-  border-radius: 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
   padding: 0.6rem 0.75rem;
   font: inherit;
 }

@@ -2,7 +2,13 @@
   <div class="focused-view" :class="{ 'full-screen': isFullScreen }">
     <!-- Header with controls - Hidden in full screen -->
     <header class="focused-header" v-if="!isFullScreen">
-      <h1 class="focused-title">Obiente Translate</h1>
+      <div class="focused-brand">
+        <span class="focused-mark" aria-hidden="true"></span>
+        <div>
+          <h1 class="focused-title">Focus Mode</h1>
+          <p>{{ unifiedFeed.segments.length }} translated lines</p>
+        </div>
+      </div>
       <div class="channel-bar">
         <div class="speaking-badges" v-if="activeChannelsWithContent.length">
           <ParticipantChip
@@ -25,7 +31,6 @@
             :key="channel.id"
             :label="channel.label"
             :title="`${channel.isActive ? 'Pause' : 'Start'} ${channel.label}`"
-            :icon="channel.isActive ? '⏸' : '▶️'"
             :isActive="channel.isActive"
             :interactive="true"
             @click="props.toggleChannel(channel.id)"
@@ -39,7 +44,7 @@
           type="button"
           title="Enter Full Screen"
         >
-          ⛶ Full Screen
+          Fullscreen
         </button>
 
         <button
@@ -47,7 +52,7 @@
           @click="$emit('toggleFocus')"
           type="button"
         >
-          📋 Exit Focus
+          Exit focus
         </button>
       </div>
     </header>
@@ -118,20 +123,19 @@
       <div
         class="focused-empty"
         v-if="
-          !activeChannelsWithContent.length &&
-          !recentHistoryWithTranslations.length &&
+          !unifiedFeed.segments.length &&
           !participants.length
         "
       >
         <div class="empty-animation">
-          <div class="microphone-icon">🎤</div>
+          <div class="microphone-icon" aria-hidden="true"></div>
           <div class="sound-waves">
             <div class="wave"></div>
             <div class="wave"></div>
             <div class="wave"></div>
           </div>
         </div>
-        <h3>Waiting for speech...</h3>
+        <h3>Waiting for speech</h3>
         <p>
           Start speaking into any active microphone to see live translations
           here
@@ -142,7 +146,7 @@
 </template>
 
 <script setup lang="ts">
-  import { ref, computed, onMounted, onUnmounted } from "vue";
+  import { ref, computed, onMounted, onUnmounted, watch } from "vue";
   import { useRoomManager } from "../composables/useRoomManager";
 
   // ...existing code...
@@ -213,6 +217,7 @@
     isActive: boolean;
     liveTranscript: string;
     liveTranslations: Record<string, Translation>;
+    lastFinalTranscript?: string;
     isFinal?: boolean;
     // Used to choose which translation to display per channel
     targetLanguages?: string[];
@@ -303,8 +308,131 @@
     originalText?: string;
     speaker?: string;
     timestamp?: number | string;
+    retained?: boolean;
   };
-  const unifiedFeed = computed(() => {
+
+  const chooseTranslation = (
+    translations: Record<string, Translation> | undefined,
+    preferred: string[] | undefined,
+  ): Translation | undefined => {
+    if (!translations || typeof translations !== "object") {
+      return undefined;
+    }
+
+    const preferredCodes = Array.isArray(preferred) ? preferred : [];
+    for (const code of preferredCodes) {
+      const entry = translations[code];
+      if (entry && (entry.primary || entry.alternatives?.[0])) {
+        return entry;
+      }
+    }
+
+    return Object.values(translations).find(
+      (entry) => entry && (entry.primary || entry.alternatives?.[0])
+    );
+  };
+
+  const segmentFingerprint = (segment: Segment): string =>
+    [
+      (segment.speaker || "").trim().toLowerCase(),
+      segment.text.trim().toLowerCase(),
+    ].join("::");
+
+  const normalizeDisplayText = (value: string): string =>
+    value
+      .toLowerCase()
+      .normalize("NFKD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[^\p{L}\p{N}\s]/gu, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const isDisplayNoise = (value: string): boolean => {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return true;
+    }
+    if (/^[^\p{L}\p{N}]+$/u.test(trimmed)) {
+      return true;
+    }
+    const normalized = normalizeDisplayText(trimmed);
+    return normalized.length === 0;
+  };
+
+  const similarity = (a: string, b: string): number => {
+    if (!a || !b) {
+      return 0;
+    }
+    if (a === b) {
+      return 1;
+    }
+    const aWords = new Set(a.split(" ").filter(Boolean));
+    const bWords = new Set(b.split(" ").filter(Boolean));
+    if (!aWords.size || !bWords.size) {
+      return 0;
+    }
+    let intersection = 0;
+    for (const word of aWords) {
+      if (bWords.has(word)) {
+        intersection += 1;
+      }
+    }
+    return intersection / Math.max(aWords.size, bWords.size);
+  };
+
+  const dedupeSegments = (segments: Segment[]): Segment[] => {
+    const out: Segment[] = [];
+
+    for (const segment of segments) {
+      if (isDisplayNoise(segment.text)) {
+        continue;
+      }
+
+      const normalized = normalizeDisplayText(segment.text);
+      const timestamp = new Date(segment.timestamp || 0).getTime();
+      const recent = out.slice(-10);
+      const duplicate = recent.some((previous) => {
+        const previousNormalized = normalizeDisplayText(previous.text);
+        if (!previousNormalized) {
+          return false;
+        }
+        const previousTimestamp = new Date(previous.timestamp || 0).getTime();
+        const nearby =
+          !timestamp ||
+          !previousTimestamp ||
+          Math.abs(timestamp - previousTimestamp) <= 45000;
+        if (!nearby) {
+          return false;
+        }
+
+        if (previousNormalized === normalized) {
+          return true;
+        }
+
+        const shortest = Math.min(previousNormalized.length, normalized.length);
+        const longest = Math.max(previousNormalized.length, normalized.length);
+        if (shortest >= 12 && longest - shortest <= 10) {
+          return similarity(previousNormalized, normalized) >= 0.82;
+        }
+
+        return false;
+      });
+
+      if (!duplicate) {
+        out.push(segment);
+      }
+    }
+
+    return out;
+  };
+
+  const retainedSegments = ref<Map<string, { segment: Segment; seenAt: number }>>(
+    new Map()
+  );
+  const RETAIN_SEGMENT_MS = 45000;
+  let retentionPruneTimer: number | null = null;
+
+  const rawUnifiedSegments = computed(() => {
     const segs: Segment[] = [];
 
     // Build quick lookup for channels by id
@@ -320,22 +448,14 @@
       const preferred = Array.isArray(ch?.targetLanguages)
         ? ch!.targetLanguages!
         : [];
-      const translations = entry.translations || {};
-      let chosen: Translation | undefined;
-      for (const code of preferred) {
-        if (translations[code]) { chosen = translations[code]; break; }
-      }
-      if (!chosen) {
-        const firstCode = Object.keys(translations)[0];
-        if (firstCode) chosen = translations[firstCode];
-      }
+      const chosen = chooseTranslation(entry.translations, preferred);
       if (!chosen) continue; // No server translation; do not show original
       const text = (chosen.primary || chosen.alternatives?.[0] || "").trim();
       if (!text) continue;
       segs.push({
         id: `h-${entry.id}`,
         text,
-        originalText: undefined,
+        originalText: entry.transcript,
         speaker: entry.channelLabel,
         timestamp: entry.timestamp,
       });
@@ -347,15 +467,7 @@
     // Live segments (one per channel), placed at the end as the most recent
     for (const ch of props.channels) {
       const preferred = Array.isArray(ch.targetLanguages) ? ch.targetLanguages : [];
-      const translations = ch.liveTranslations || {};
-      let chosen: Translation | undefined;
-      for (const code of preferred) {
-        if (translations[code]) { chosen = translations[code]; break; }
-      }
-      if (!chosen) {
-        const firstCode = Object.keys(translations)[0];
-        if (firstCode) chosen = translations[firstCode];
-      }
+      const chosen = chooseTranslation(ch.liveTranslations, preferred);
       if (!chosen) continue; // No server translation yet — do not show original/liveTranscript
       const text = (chosen.primary || chosen.alternatives?.[0] || "").trim();
       if (!text) continue;
@@ -365,14 +477,86 @@
       segs.push({
         id: `l-${ch.id}`,
         text,
-        originalText: undefined,
+        originalText: ch.liveTranscript || ch.lastFinalTranscript,
         speaker: ch.label,
         timestamp: Date.now(),
       });
     }
 
-    // Sort again by timestamp as live segments use now()
     segs.sort(
+      (a, b) =>
+        new Date(a.timestamp || 0).getTime() -
+        new Date(b.timestamp || 0).getTime()
+    );
+
+    return dedupeSegments(segs);
+  });
+
+  watch(
+    rawUnifiedSegments,
+    (segments) => {
+      const now = Date.now();
+      const next = new Map(retainedSegments.value);
+      const liveKeys = new Set<string>();
+
+      for (const segment of segments) {
+        const key = segmentFingerprint(segment);
+        liveKeys.add(key);
+        next.set(key, {
+          segment: { ...segment, retained: false },
+          seenAt: now,
+        });
+      }
+
+      for (const [key, value] of next) {
+        if (liveKeys.has(key)) {
+          continue;
+        }
+        if (now - value.seenAt > RETAIN_SEGMENT_MS) {
+          next.delete(key);
+        } else {
+          next.set(key, {
+            ...value,
+            segment: { ...value.segment, retained: true },
+          });
+        }
+      }
+
+      retainedSegments.value = next;
+    },
+    { immediate: true }
+  );
+
+  const pruneRetainedSegments = () => {
+    const now = Date.now();
+    const next = new Map(retainedSegments.value);
+    for (const [key, value] of next) {
+      if (now - value.seenAt > RETAIN_SEGMENT_MS) {
+        next.delete(key);
+      }
+    }
+    retainedSegments.value = next;
+  };
+
+  onMounted(() => {
+    retentionPruneTimer = window.setInterval(pruneRetainedSegments, 5000);
+  });
+
+  onUnmounted(() => {
+    if (retentionPruneTimer !== null) {
+      clearInterval(retentionPruneTimer);
+      retentionPruneTimer = null;
+    }
+  });
+
+  const unifiedFeed = computed(() => {
+    const raw = rawUnifiedSegments.value;
+    const rawKeys = new Set(raw.map(segmentFingerprint));
+    const retainedOnly = Array.from(retainedSegments.value.values())
+      .map((entry) => entry.segment)
+      .filter((segment) => !rawKeys.has(segmentFingerprint(segment)));
+
+    const segs = dedupeSegments([...raw, ...retainedOnly]).sort(
       (a, b) =>
         new Date(a.timestamp || 0).getTime() -
         new Date(b.timestamp || 0).getTime()

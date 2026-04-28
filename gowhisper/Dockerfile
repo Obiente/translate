@@ -60,7 +60,7 @@ RUN go build -tags whisper_cpp -o /out/whisper-server ./cmd/server
 FROM debian:bookworm-slim AS model
 ARG DEBIAN_FRONTEND=noninteractive
 ARG DOWNLOAD_MODEL=0
-ARG MODEL_NAME=large-v3-turbo
+ARG MODEL_NAME=base
 RUN set -eux; \
     mkdir -p /out; \
     if [ "$DOWNLOAD_MODEL" = "1" ]; then \
@@ -76,6 +76,8 @@ FROM debian:bookworm-slim AS runtime
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
+    ffmpeg \
     libstdc++6 \
     libgomp1 \
   && rm -rf /var/lib/apt/lists/*
@@ -89,7 +91,7 @@ COPY --from=builder /out/whisper-server /usr/local/bin/whisper-server
 
 # Default configuration; override at runtime as needed
 # MODEL_NAME controls the expected model filename (ggml-${MODEL_NAME}.bin)
-ARG MODEL_NAME=large-v3-turbo
+ARG MODEL_NAME=base
 ENV WHISPER_GO_ADDR=:8080 \
   WHISPER_MODEL_PATH=/models/ggml-${MODEL_NAME}.bin \
   WHISPER_THREADS=8 \

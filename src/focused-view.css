@@ -876,3 +876,146 @@
     text-shadow: 0 0 2px rgba(255, 255, 255, 0.1);
   }
 }
+
+/* Focus Mode overhaul */
+.focused-view {
+  background:
+    radial-gradient(circle at 12% 8%, rgba(240, 200, 90, 0.12), transparent 28rem),
+    radial-gradient(circle at 92% 20%, rgba(79, 177, 141, 0.16), transparent 30rem),
+    #10120f;
+  color: var(--text);
+}
+
+.focused-header {
+  background: rgba(16, 18, 15, 0.88);
+  border-bottom: 1px solid var(--border);
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.22);
+}
+
+.focused-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.75rem;
+  min-width: 190px;
+}
+
+.focused-mark {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  background:
+    linear-gradient(90deg, transparent 44%, rgba(20, 23, 17, 0.4) 44% 56%, transparent 56%),
+    linear-gradient(180deg, var(--accent), var(--accent-2));
+  box-shadow: 0 12px 24px rgba(240, 200, 90, 0.16);
+}
+
+.focused-title {
+  color: var(--text);
+  font-family: "Iowan Old Style", Georgia, serif;
+  font-size: 1.25rem;
+  letter-spacing: 0;
+  line-height: 1;
+}
+
+.focused-brand p {
+  margin: 0.2rem 0 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.channel-bar {
+  gap: 0.45rem;
+}
+
+.header-actions {
+  gap: 0.5rem;
+}
+
+.header-actions .button:nth-child(2),
+.button.focus-toggle.active {
+  background: var(--accent);
+  color: var(--ink);
+  border: 1px solid var(--accent);
+  box-shadow: none;
+}
+
+.focused-content {
+  background:
+    linear-gradient(rgba(246, 238, 214, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(246, 238, 214, 0.025) 1px, transparent 1px);
+  background-size: 72px 72px;
+}
+
+.embedded-lyrics,
+.focused-view.full-screen .full-screen-feed {
+  position: relative;
+}
+
+.embedded-lyrics::before,
+.focused-view.full-screen .full-screen-feed::before {
+  content: "";
+  position: fixed;
+  inset: auto 0 0;
+  height: 34vh;
+  pointer-events: none;
+  background: linear-gradient(transparent, rgba(16, 18, 15, 0.88));
+  z-index: 1;
+}
+
+.focused-view.full-screen {
+  background:
+    radial-gradient(circle at 10% 0%, rgba(240, 200, 90, 0.12), transparent 34rem),
+    radial-gradient(circle at 86% 14%, rgba(79, 177, 141, 0.13), transparent 34rem),
+    #070806;
+}
+
+.focused-view.full-screen .focused-content {
+  background: transparent;
+}
+
+.focused-view.full-screen .full-screen-feed {
+  width: min(1200px, 94vw);
+  padding: 1rem 0;
+}
+
+.focused-view.full-screen .full-screen-participants-bar,
+.brand-watermark {
+  background: rgba(16, 18, 15, 0.72);
+  border-color: var(--border);
+  color: var(--muted);
+}
+
+.brand-watermark {
+  border-radius: 7px;
+}
+
+.button.full-screen-exit {
+  background: rgba(16, 18, 15, 0.84);
+  border-color: var(--border);
+  color: var(--text);
+  border-radius: 8px;
+}
+
+.microphone-icon {
+  width: clamp(54px, 12vw, 84px);
+  height: clamp(54px, 12vw, 84px);
+  border-radius: 999px;
+  border: 1px solid rgba(240, 200, 90, 0.4);
+  background:
+    linear-gradient(90deg, transparent 46%, rgba(240, 200, 90, 0.72) 46% 54%, transparent 54%),
+    radial-gradient(circle, rgba(240, 200, 90, 0.18), rgba(79, 177, 141, 0.09));
+  filter: none;
+}
+
+.wave {
+  background: linear-gradient(to top, var(--accent), var(--accent-2));
+}
+
+.focused-empty h3 {
+  color: var(--text);
+  font-family: "Iowan Old Style", Georgia, serif;
+}
+
+.focused-empty p {
+  color: var(--muted);
+}

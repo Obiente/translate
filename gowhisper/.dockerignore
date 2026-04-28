@@ -1,0 +1,4 @@
+.local/
+models/
+tmp/
+*.log

@@ -59,6 +59,23 @@ export default defineConfig({
     port: 3000,
     host: true,
     allowedHosts: true,
+    watch: {
+      ignored: [
+        "**/gowhisper/.local/**",
+        "**/gowhisper/models/**",
+      ],
+    },
+    proxy: {
+      "/transcribe": "http://127.0.0.1:8080",
+      "/translate": "http://127.0.0.1:8080",
+      "/detect": "http://127.0.0.1:8080",
+      "/languages": "http://127.0.0.1:8080",
+      "/healthz": "http://127.0.0.1:8080",
+      "/ws": {
+        target: "ws://127.0.0.1:8080",
+        ws: true,
+      },
+    },
   },
   define: {
     // Make env variables available in the app

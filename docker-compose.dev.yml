@@ -1,0 +1,24 @@
+name: obiente-translate-dev
+
+services:
+  gowhisper:
+    image: obiente-translate-gowhisper:dev
+    build:
+      context: ./gowhisper
+      args:
+        WHISPER_CPP_REF: ${WHISPER_CPP_REF:-master}
+        DOWNLOAD_MODEL: ${DOWNLOAD_MODEL:-0}
+        MODEL_NAME: ${MODEL_NAME:-base}
+    ports:
+      - "${WHISPER_GO_PORT:-8080}:8080"
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - ./gowhisper/models:/models
+    environment:
+      WHISPER_GO_ADDR: ":8080"
+      WHISPER_MODEL_PATH: "/models/ggml-${MODEL_NAME:-base}.bin"
+      WHISPER_THREADS: "${WHISPER_THREADS:-8}"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+      TRANSLATION_BASE_URL: "${TRANSLATION_BASE_URL:-https://libretranslate.obiente.cloud}"
+      WHISPER_SERVER_TRANSLATIONS: "${WHISPER_SERVER_TRANSLATIONS:-true}"
+      TRANSLATION_TIMEOUT: "${TRANSLATION_TIMEOUT:-8}"

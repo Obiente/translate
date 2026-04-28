@@ -44,7 +44,7 @@ func getenvInt(key string, def int) int {
 func Load() Config {
 	return Config{
 		Addr:                  getenv("WHISPER_GO_ADDR", ":8080"),
-		ModelPath:             getenv("WHISPER_MODEL_PATH", "./models/ggml-base.en.bin"),
+		ModelPath:             getenv("WHISPER_MODEL_PATH", "./models/ggml-base.bin"),
 		TranslationBaseURL:    getenv("TRANSLATION_BASE_URL", "https://libretranslate.obiente.cloud"),
 		TranslationEnabled:    getenvBool("WHISPER_SERVER_TRANSLATIONS", true),
 		TranslationTimeoutSec: getenvInt("TRANSLATION_TIMEOUT", 8),

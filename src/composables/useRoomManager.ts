@@ -17,8 +17,19 @@ export interface RoomTranscript {
 
 type RoomStatus = 'idle' | 'connecting' | 'connected' | 'error';
 
-const DEFAULT_WHISPER_STREAMING_ENDPOINT =
-  'wss://whisper.obiente.cloud/ws/transcribe';
+const resolveDefaultStreamingEndpoint = (): string => {
+  if (typeof window === 'undefined') {
+    return 'wss://whisper.obiente.cloud/ws/transcribe';
+  }
+  const host = window.location.hostname;
+  if (host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0') {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${protocol}//${window.location.host}/ws/transcribe`;
+  }
+  return 'wss://whisper.obiente.cloud/ws/transcribe';
+};
+
+const DEFAULT_WHISPER_STREAMING_ENDPOINT = resolveDefaultStreamingEndpoint();
 const WHISPER_STREAMING_ENDPOINT =
   (import.meta.env.VITE_WHISPER_STREAMING_ENDPOINT as string | undefined)?.trim() ||
   DEFAULT_WHISPER_STREAMING_ENDPOINT;

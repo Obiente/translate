@@ -19,3 +19,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Local speech runtime artifacts
+gowhisper/.local/
+gowhisper/models/

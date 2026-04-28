@@ -1,5 +1,9 @@
 <template>
-  <div class="app" :class="{ 'app-focused': showFocusedView }">
+  <DiscordCaptionRoom
+    v-if="discordSessionId"
+    :session-id="discordSessionId"
+  />
+  <div v-else class="app" :class="{ 'app-focused': showFocusedView }">
     <header class="page-header" v-if="!showFocusedView">
       <div class="page-topbar">
         <div class="brand">
@@ -74,16 +78,52 @@
             @click="showFocusedView = true"
             title="Enter Focus Mode"
           >
-            🎯 Enter Focus Mode
+            Focus Mode
           </button>
         </div>
       </div>
       <div class="page-hero">
-        <h1>Live Multi-Source Translator</h1>
-        <p>
-          Add participants, pick their input sources, and let the app
-          translate conversations in real time.
-        </p>
+        <div class="hero-copy">
+          <span class="eyebrow">Realtime speech operations</span>
+          <h1>Capture, translate, and share live conversation.</h1>
+          <p>
+            A faster command surface for microphones, system audio, rooms, and
+            local low-latency translation.
+          </p>
+        </div>
+        <div class="hero-readout" aria-label="Session overview">
+          <div>
+            <span>{{ activeChannelCount }}</span>
+            <small>active</small>
+          </div>
+          <div>
+            <span>{{ channels.length }}</span>
+            <small>sources</small>
+          </div>
+          <div>
+            <span>{{ recentHistory.length }}</span>
+            <small>recent</small>
+          </div>
+          <div>
+            <span>{{ roomMemberCount }}</span>
+            <small>room</small>
+          </div>
+        </div>
+      </div>
+
+      <div class="session-strip">
+        <div class="session-item">
+          <span class="session-label">Engine</span>
+          <strong>{{ transcriptionMode === "streaming" ? "Streaming" : "Chunked" }}</strong>
+        </div>
+        <div class="session-item wide">
+          <span class="session-label">Selected targets</span>
+          <strong>{{ selectedTargetsLabel }}</strong>
+        </div>
+        <div class="session-item">
+          <span class="session-label">Room</span>
+          <strong>{{ room.status }}</strong>
+        </div>
       </div>
     </header>
 
@@ -96,7 +136,7 @@
     <section class="workspace" v-if="!showFocusedView">
       <aside class="participants-panel">
         <header class="panel-header">
-          <h2>Participants</h2>
+          <h2>Sources</h2>
           <span class="participant-count">{{ channels.length }}</span>
         </header>
 
@@ -107,7 +147,7 @@
             @click="addMicrophoneChannel"
             :disabled="!speechSupported"
           >
-            Add Microphone
+            + Microphone
           </button>
           <button
             class="button"
@@ -115,7 +155,7 @@
             @click="addSystemChannel"
             :disabled="hasSystemChannel || !desktopCaptureSupported"
           >
-            Add System Audio
+            + System Audio
           </button>
         </div>
 
@@ -126,8 +166,8 @@
             <option value="streaming">Streaming (beta)</option>
           </select>
           <p class="mode-hint">
-            Chunked uploads send periodic audio blobs. Streaming keeps a live
-            WebSocket open for lower latency.
+            Streaming keeps a live socket open for the lowest latency. Chunked
+            uploads are a compatibility fallback.
           </p>
           <p class="mode-hint warning" v-if="isAnyChannelActive">
             Active participants continue using their current mode until
@@ -193,7 +233,7 @@
                   @click.stop="toggleChannel(channel.id)"
                   :disabled="channel.sourceType === 'room'"
                 >
-                  {{ channel.isActive ? "Pause" : "Start" }}
+                  {{ channel.isActive ? "Pause" : "Listen" }}
                 </button>
                 <button
                   class="button"
@@ -220,7 +260,7 @@
 
       <div class="detail-panel" v-if="selectedChannel">
         <header class="detail-header">
-          <div>
+          <div class="detail-title-block">
             <h2>{{ selectedChannel.label }}</h2>
             <p class="channel-meta">
               <template v-if="selectedChannel.sourceType === 'room'">Room participant</template>
@@ -245,7 +285,7 @@
               @click="toggleChannel(selectedChannel.id)"
               :disabled="selectedChannel.sourceType === 'room'"
             >
-              {{ selectedChannel.isActive ? "Pause" : "Start Listening" }}
+              {{ selectedChannel.isActive ? "Pause" : "Start" }}
             </button>
             <button
               class="button"
@@ -256,6 +296,14 @@
             </button>
           </div>
         </header>
+
+        <div class="live-banner" :class="{ active: selectedChannel.isActive }">
+          <span class="live-dot" aria-hidden="true"></span>
+          <div>
+            <strong>{{ selectedChannel.isActive ? "Listening now" : "Ready" }}</strong>
+            <p>{{ latestTranscript || "No speech has been captured for this source yet." }}</p>
+          </div>
+        </div>
 
         <div class="detail-controls">
           <div class="control-group">
@@ -477,14 +525,14 @@
             @click="showFocusedView = !showFocusedView"
             type="button"
           >
-            {{ showFocusedView ? "📋 Normal View" : "🎯 Focus View" }}
+            {{ showFocusedView ? "Normal View" : "Focus View" }}
           </button>
           <label class="alternatives-toggle">
             <input type="checkbox" v-model="showTranslationAlternatives" />
             Show alternatives
           </label>
           <span class="participant-count"
-            >{{ channels.filter((c) => c.isActive).length }} active</span
+            >{{ activeChannelCount }} active</span
           >
         </div>
       </header>
@@ -594,10 +642,11 @@
 </template>
 
 <script setup lang="ts">
-  import { ref, onMounted, watch } from "vue";
+  import { ref, onMounted, watch, computed } from "vue";
   import { useLiveTranslation } from "./composables/useLiveTranslation";
   import FocusedView from "./components/FocusedView.vue";
   import ConversationFeed from "./components/ConversationFeed.vue";
+  import DiscordCaptionRoom from "./components/DiscordCaptionRoom.vue";
   import "./app.css";
   import { FOCUSED_VIEW_STATE_KEY } from "./constants/storage";
   import { useRoomManager } from "./composables/useRoomManager";
@@ -605,6 +654,11 @@
   // Local reactive state
   // Default to settings (non-focused) on first load; then restore last state if available
   const showFocusedView = ref(false);
+  const discordSessionId = computed(() => {
+    if (typeof window === "undefined") return "";
+    const match = window.location.pathname.match(/^\/(?:discord|rooms|live)\/([^/?#]+)/i);
+    return match ? decodeURIComponent(match[1]) : "";
+  });
 
   onMounted(() => {
     try {
@@ -656,6 +710,23 @@
   const roomName = ref("");
   const roomDropdownOpen = ref(false);
   const copied = ref(false);
+  const activeChannelCount = computed(() =>
+    channels.value.filter((channel) => channel.isActive).length
+  );
+  const roomMemberCount = computed(() => room.members.length);
+  const selectedTargetsLabel = computed(() => {
+    const targets = selectedChannel.value?.targetLanguages ?? [];
+    if (targets.length === 0) {
+      return "No targets";
+    }
+    return targets.map((code) => getLanguageName(code)).join(", ");
+  });
+  const latestTranscript = computed(() =>
+    selectedChannel.value?.liveTranscript ||
+    selectedChannel.value?.lastFinalTranscript ||
+    recentHistory.value[0]?.transcript ||
+    ""
+  );
   // Initialize room socket early if a persisted room exists
   if (room.isInRoom() && !room.isConnected()) {
     try { room.ensureSocket(); } catch {}
@@ -837,7 +908,7 @@
     opacity: 0.6;
   }
   .site-footer a {
-    color: #1db954;
+    color: var(--accent);
     text-decoration: none;
     opacity: 0.9;
   }
@@ -847,19 +918,19 @@
   }
   /* Rooms dropdown */
   .dropdown { position: relative; margin-right: 0.5rem; }
-  .dropdown > .button { background: rgba(255,255,255,0.1); }
+  .dropdown > .button { background: rgba(246, 238, 214, 0.08); }
   .rooms-button { display: inline-flex; align-items: center; gap: 0.35rem; }
   .rooms-button .dot { width: 8px; height: 8px; border-radius: 50%; background: rgba(255,255,255,0.35); display: inline-block; }
-  .rooms-button .dot.on { background: #38d39f; }
+  .rooms-button .dot.on { background: var(--success); }
   .rooms-button .dot.dim { background: #d0a438; }
   .rooms-button .sep { opacity: 0.6; }
   .rooms-button .room-code { font-size: 0.85rem; }
   .rooms-button .count { background: rgba(255,255,255,0.08); padding: 0 0.35rem; border-radius: 999px; font-size: 0.8rem; }
   .rooms-button .caret { margin-left: 0.25rem; opacity: 0.8; }
-  .dropdown-menu { position: absolute; right: 0; top: 110%; min-width: 280px; background: rgba(10,10,10,0.95); border: 1px solid rgba(255,255,255,0.15); border-radius: 10px; padding: 0.75rem; box-shadow: 0 10px 24px rgba(0,0,0,0.35); z-index: 50; }
+  .dropdown-menu { position: absolute; right: 0; top: 110%; min-width: 280px; background: rgba(17,19,15,0.96); border: 1px solid var(--border); border-radius: 8px; padding: 0.75rem; box-shadow: 0 18px 44px rgba(0,0,0,0.45); z-index: 50; }
   .dropdown-section { display: flex; flex-direction: column; gap: 0.35rem; margin-bottom: 0.6rem; }
   .dropdown-section label { font-size: 0.8rem; opacity: 0.8; }
-  .dropdown-section input { padding: 0.5rem 0.6rem; border-radius: 6px; border: 1px solid rgba(255,255,255,0.2); background: rgba(0,0,0,0.2); color: white; }
+  .dropdown-section input { padding: 0.5rem 0.6rem; border-radius: 7px; border: 1px solid var(--border); background: rgba(0,0,0,0.2); color: var(--text); }
   .dropdown-actions { display: flex; gap: 0.5rem; justify-content: flex-end; margin-top: 0.25rem; }
   .dropdown-status { margin-top: 0.5rem; font-size: 0.9rem; opacity: 0.95; display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
   .pill { padding: 0.15rem 0.5rem; border-radius: 999px; background: rgba(255,255,255,0.1); text-transform: capitalize; }
@@ -867,5 +938,5 @@
   .copy-btn { padding: 0.15rem 0.5rem; font-size: 0.8rem; background: rgba(255,255,255,0.08); }
   .room-members { list-style: none; padding: 0; margin: 0.25rem 0 0; display: flex; gap: 0.35rem; flex-wrap: wrap; }
   .room-members .badge { background: rgba(255,255,255,0.08); padding: 0.2rem 0.45rem; border-radius: 999px; font-size: 0.85rem; display: inline-flex; align-items: center; gap: 0.35rem; }
-  .you-pill { background: #2f855a; color: #fff; padding: 0.05rem 0.4rem; border-radius: 999px; font-size: 0.7rem; text-transform: lowercase; }
+  .you-pill { background: var(--accent-2); color: #07110c; padding: 0.05rem 0.4rem; border-radius: 999px; font-size: 0.7rem; text-transform: lowercase; }
 </style>

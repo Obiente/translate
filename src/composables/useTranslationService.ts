@@ -30,7 +30,11 @@ interface LibreDetectResponse {
   confidence: number;
 }
 
-const DEFAULT_LIBRE_BASE = "https://libretranslate.obiente.cloud";
+const DEFAULT_LIBRE_BASE =
+  typeof window !== "undefined" &&
+    ["localhost", "127.0.0.1", "0.0.0.0"].includes(window.location.hostname)
+    ? ""
+    : "https://libretranslate.obiente.cloud";
 const DEFAULT_ALTERNATIVES = 3;
 
 const libreBase =

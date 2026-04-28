@@ -35,12 +35,40 @@ interface FinalTranscriptPayload {
   detectedLanguage?: string | null;
 }
 
-const DEFAULT_WHISPER_ENDPOINT = "https://whisper.obiente.cloud/transcribe";
+const resolveLocalHttpEndpoint = (path: string, fallback: string): string => {
+  if (typeof window === "undefined") {
+    return fallback;
+  }
+  const host = window.location.hostname;
+  if (host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0") {
+    return path;
+  }
+  return fallback;
+};
+
+const resolveLocalWsEndpoint = (path: string, fallback: string): string => {
+  if (typeof window === "undefined") {
+    return fallback;
+  }
+  const host = window.location.hostname;
+  if (host !== "localhost" && host !== "127.0.0.1" && host !== "0.0.0.0") {
+    return fallback;
+  }
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}${path}`;
+};
+
+const DEFAULT_WHISPER_ENDPOINT = resolveLocalHttpEndpoint(
+  "/transcribe",
+  "https://whisper.obiente.cloud/transcribe",
+);
 const WHISPER_ENDPOINT =
   (import.meta.env.VITE_WHISPER_ENDPOINT as string | undefined)?.trim() ||
   DEFAULT_WHISPER_ENDPOINT;
-const DEFAULT_WHISPER_STREAMING_ENDPOINT =
-  "wss://whisper.obiente.cloud/ws/transcribe";
+const DEFAULT_WHISPER_STREAMING_ENDPOINT = resolveLocalWsEndpoint(
+  "/ws/transcribe",
+  "wss://whisper.obiente.cloud/ws/transcribe",
+);
 const WHISPER_STREAMING_ENDPOINT =
   (import.meta.env.VITE_WHISPER_STREAMING_ENDPOINT as string | undefined)
     ?.trim() ||
@@ -52,6 +80,15 @@ const createId = (): string =>
   typeof crypto !== "undefined" && "randomUUID" in crypto
     ? crypto.randomUUID()
     : Math.random().toString(36).slice(2, 10);
+
+const normalizeComparableText = (value: string): string =>
+  value
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\p{L}\p{N}\s]/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
 
 const createChannel = (
   sourceType: ConversationChannel["sourceType"],
@@ -249,12 +286,8 @@ export const useLiveTranslation = () => {
       const hasServerTranslations =
         Object.keys(filteredServerTranslations).length > 0;
 
-      if (isFinal) {
-        channel.liveTranslations = hasServerTranslations ? filteredServerTranslations : {};
-      } else if (hasServerTranslations) {
+      if (hasServerTranslations) {
         channel.liveTranslations = filteredServerTranslations;
-      } else {
-        channel.liveTranslations = {};
       }
 
       await handleFinalTranscript(channel, {
@@ -299,12 +332,8 @@ export const useLiveTranslation = () => {
       const hasServerTranslations =
         Object.keys(filteredServerTranslations).length > 0;
 
-      if (isFinal) {
-        channel.liveTranslations = hasServerTranslations ? filteredServerTranslations : {};
-      } else if (hasServerTranslations) {
+      if (hasServerTranslations) {
         channel.liveTranslations = filteredServerTranslations;
-      } else {
-        channel.liveTranslations = {};
       }
 
       await handleFinalTranscript(channel, {
@@ -788,6 +817,29 @@ export const useLiveTranslation = () => {
   };
 
   const conversationHistoryPush = (entry: ConversationHistoryEntry): void => {
+    const normalizedTranscript = normalizeComparableText(entry.transcript);
+    const entryTime = new Date(entry.timestamp).getTime();
+    const alreadyRecorded = conversationHistory.value
+      .slice(-12)
+      .some((previous) => {
+        if (previous.channelId !== entry.channelId) {
+          return false;
+        }
+        const previousTime = new Date(previous.timestamp).getTime();
+        if (
+          Number.isFinite(entryTime) &&
+          Number.isFinite(previousTime) &&
+          Math.abs(entryTime - previousTime) > 30000
+        ) {
+          return false;
+        }
+        return normalizeComparableText(previous.transcript) === normalizedTranscript;
+      });
+
+    if (normalizedTranscript && alreadyRecorded) {
+      return;
+    }
+
     conversationHistory.value.push({
       ...entry,
       translations: normalizeTranslationMap(entry.translations),

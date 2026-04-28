@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -14,6 +16,7 @@ type Client struct {
 	base    string
 	http    *http.Client
 	timeout time.Duration
+	cache   sync.Map
 }
 
 func New(base string, timeoutSec int) *Client {
@@ -27,6 +30,142 @@ func New(base string, timeoutSec int) *Client {
 	}
 }
 
+type TranslationEntry struct {
+	Primary          string   `json:"primary"`
+	Alternatives     []string `json:"alternatives,omitempty"`
+	DetectedLanguage string   `json:"detectedLanguage,omitempty"`
+}
+
+type TranslateRequest struct {
+	Text         string   `json:"q"`
+	Source       string   `json:"source"`
+	Target       string   `json:"target"`
+	Format       string   `json:"format"`
+	Alternatives int      `json:"alternatives,omitempty"`
+	Targets      []string `json:"targets,omitempty"`
+}
+
+type LibreTranslateResponse struct {
+	TranslatedText   string   `json:"translatedText"`
+	Alternatives     []string `json:"alternatives"`
+	DetectedLanguage string   `json:"detectedLanguage"`
+}
+
+type LanguageEntry struct {
+	Code string `json:"code"`
+	Name string `json:"name"`
+}
+
+type DetectResult struct {
+	Language   string  `json:"language"`
+	Confidence float64 `json:"confidence"`
+}
+
+func normalizeBase(base string) string {
+	return strings.TrimRight(strings.TrimSpace(base), "/")
+}
+
+func (c *Client) endpoint(path string) string {
+	return normalizeBase(c.base) + path
+}
+
+func (c *Client) cacheKey(text string, source string, target string, altLimit int) string {
+	return strings.Join([]string{
+		strings.TrimSpace(text),
+		strings.TrimSpace(source),
+		strings.TrimSpace(target),
+		fmt.Sprintf("%d", altLimit),
+	}, "\x00")
+}
+
+func normalizeAlternatives(values []string, primary string) []string {
+	seen := make(map[string]bool, len(values))
+	out := make([]string, 0, len(values))
+	primary = strings.TrimSpace(primary)
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" || trimmed == primary || seen[trimmed] {
+			continue
+		}
+		seen[trimmed] = true
+		out = append(out, trimmed)
+	}
+	return out
+}
+
+func (c *Client) TranslateOne(ctx context.Context, text string, source string, target string, altLimit int) (TranslationEntry, error) {
+	if c == nil || strings.TrimSpace(c.base) == "" {
+		return TranslationEntry{}, nil
+	}
+
+	text = strings.TrimSpace(text)
+	target = strings.TrimSpace(target)
+	source = strings.TrimSpace(source)
+	if source == "" {
+		source = "auto"
+	}
+	if altLimit < 0 {
+		altLimit = 0
+	}
+	if altLimit > 5 {
+		altLimit = 5
+	}
+	if text == "" || target == "" {
+		return TranslationEntry{}, nil
+	}
+	if source != "auto" && source == target {
+		entry := TranslationEntry{Primary: text, Alternatives: []string{}, DetectedLanguage: source}
+		c.cache.Store(c.cacheKey(text, source, target, altLimit), entry)
+		return entry, nil
+	}
+
+	key := c.cacheKey(text, source, target, altLimit)
+	if cached, ok := c.cache.Load(key); ok {
+		if entry, ok := cached.(TranslationEntry); ok {
+			return entry, nil
+		}
+	}
+
+	payload := TranslateRequest{
+		Text:         text,
+		Source:       source,
+		Target:       target,
+		Format:       "text",
+		Alternatives: altLimit,
+	}
+
+	b, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint("/translate"), bytes.NewReader(b))
+	if err != nil {
+		return TranslationEntry{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return TranslationEntry{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return TranslationEntry{}, fmt.Errorf("translation http %d for target %s: %s", resp.StatusCode, target, strings.TrimSpace(string(body)))
+	}
+
+	var lr LibreTranslateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&lr); err != nil {
+		return TranslationEntry{}, err
+	}
+
+	entry := TranslationEntry{
+		Primary:          strings.TrimSpace(lr.TranslatedText),
+		Alternatives:     normalizeAlternatives(lr.Alternatives, lr.TranslatedText),
+		DetectedLanguage: strings.TrimSpace(lr.DetectedLanguage),
+	}
+	c.cache.Store(key, entry)
+	return entry, nil
+}
+
 // Translate requests translations for text into targets.
 // It calls the translation endpoint once per target using the LibreTranslate
 // compatible payload (q, source, target, format, alternatives) and returns
@@ -38,70 +177,105 @@ func (c *Client) Translate(ctx context.Context, text string, source string, targ
 	}
 
 	out := make(map[string]map[string]any, len(targets))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(targets))
+	seen := make(map[string]bool, len(targets))
 
-	// Prepare a sensible source value: use provided source if non-empty, otherwise "auto"
-	src := strings.TrimSpace(source)
-	if src == "" {
-		src = "auto"
+	for _, rawTarget := range targets {
+		tgt := strings.TrimSpace(rawTarget)
+		if tgt == "" || seen[tgt] {
+			continue
+		}
+		seen[tgt] = true
+		wg.Add(1)
+		go func(target string) {
+			defer wg.Done()
+			entry, err := c.TranslateOne(ctx, text, source, target, altLimit)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if entry.Primary == "" && len(entry.Alternatives) == 0 {
+				return
+			}
+			payload := map[string]any{"primary": entry.Primary}
+			if len(entry.Alternatives) > 0 {
+				payload["alternatives"] = entry.Alternatives
+			}
+			if entry.DetectedLanguage != "" {
+				payload["detectedLanguage"] = entry.DetectedLanguage
+			}
+			mu.Lock()
+			out[target] = payload
+			mu.Unlock()
+		}(tgt)
 	}
+	wg.Wait()
+	close(errCh)
 
-	for _, tgt := range targets {
-		payload := map[string]any{
-			"q":      text,
-			"source": src,
-			"target": tgt,
-			"format": "text",
-		}
-		if altLimit > 0 {
-			payload["alternatives"] = altLimit
-		}
-
-		b, _ := json.Marshal(payload)
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/translate", bytes.NewReader(b))
+	if len(out) > 0 {
+		return out, nil
+	}
+	for err := range errCh {
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := c.http.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return nil, fmt.Errorf("translation http %d for target %s", resp.StatusCode, tgt)
-		}
-
-		// Expect LibreTranslate-like response: translatedText, alternatives, detectedLanguage
-		var lr struct {
-			TranslatedText   string   `json:"translatedText"`
-			Alternatives     []string `json:"alternatives"`
-			DetectedLanguage string   `json:"detectedLanguage"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&lr); err != nil {
-			return nil, err
-		}
-
-		// Build back a flexible structure the frontend normalizer can understand
-		entry := map[string]any{"primary": strings.TrimSpace(lr.TranslatedText)}
-		if len(lr.Alternatives) > 0 {
-			alts := make([]string, 0, len(lr.Alternatives))
-			for _, a := range lr.Alternatives {
-				s := strings.TrimSpace(a)
-				if s != "" {
-					alts = append(alts, s)
-				}
-			}
-			if len(alts) > 0 {
-				entry["alternatives"] = alts
-			}
-		}
-		if lr.DetectedLanguage != "" {
-			entry["detectedLanguage"] = lr.DetectedLanguage
-		}
-		out[tgt] = entry
 	}
 
 	return out, nil
+}
+
+func (c *Client) Detect(ctx context.Context, text string) ([]DetectResult, error) {
+	text = strings.TrimSpace(text)
+	if c == nil || strings.TrimSpace(c.base) == "" || text == "" {
+		return []DetectResult{}, nil
+	}
+
+	b, _ := json.Marshal(map[string]string{"q": text})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint("/detect"), bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("detect http %d", resp.StatusCode)
+	}
+
+	var results []DetectResult
+	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+func (c *Client) Languages(ctx context.Context) ([]LanguageEntry, error) {
+	if c == nil || strings.TrimSpace(c.base) == "" {
+		return []LanguageEntry{}, nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint("/languages"), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("languages http %d", resp.StatusCode)
+	}
+
+	var entries []LanguageEntry
+	if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
+		return nil, err
+	}
+	return entries, nil
 }

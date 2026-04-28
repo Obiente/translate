@@ -21,7 +21,7 @@ import os
 import time
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Dict, Iterable, List, Optional, Tuple, Set
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Set
 
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
@@ -72,9 +72,16 @@ TRANSLATION_BASE_URL = os.getenv("TRANSLATION_BASE_URL", "http://127.0.0.1:5000"
 TRANSLATION_TIMEOUT = _env_float("TRANSLATION_TIMEOUT", 8.0)
 TRANSLATION_ENABLED = _env_flag("WHISPER_SERVER_TRANSLATIONS", "true")
 TRANSLATION_ALTERNATIVES_MAX = min(max(_env_int("TRANSLATION_ALTERNATIVES", 5), 0), 5)
+TRANSLATION_PROVIDER = os.getenv("TRANSLATION_PROVIDER", "auto").strip().lower()
+TRANSLATION_CACHE_TTL = max(_env_float("TRANSLATION_CACHE_TTL", 60 * 60), 0)
+TRANSLATION_CACHE_MAX = max(_env_int("TRANSLATION_CACHE_MAX", 2048), 0)
 
 _translation_client: httpx.AsyncClient | None = None
 _translation_client_lock = asyncio.Lock()
+_translation_cache: Dict[Tuple[str, str, str, int], Tuple[float, Dict[str, object], Optional[str]]] = {}
+_translation_cache_lock = asyncio.Lock()
+_argos_translate: Any = None
+_argos_checked = False
 
 
 async def _get_translation_client() -> httpx.AsyncClient:
@@ -146,6 +153,162 @@ def _coerce_alternative_limit(raw_value: object) -> int:
     return min(numeric, TRANSLATION_ALTERNATIVES_MAX)
 
 
+def _normalize_translation_alternatives(raw_alternatives: object, primary: str) -> List[str]:
+    alternatives: List[str] = []
+    if not isinstance(raw_alternatives, list):
+        return alternatives
+    for entry in raw_alternatives:
+        value = None
+        if isinstance(entry, str):
+            value = entry.strip()
+        elif isinstance(entry, dict):
+            for key in ("translatedText", "translation", "text", "value"):
+                maybe = entry.get(key)
+                if isinstance(maybe, str):
+                    value = maybe.strip()
+                    if value:
+                        break
+        if value and value != primary and value not in alternatives:
+            alternatives.append(value)
+    return alternatives
+
+
+def _get_argos_translate() -> Any:
+    global _argos_translate, _argos_checked
+    if _argos_checked:
+        return _argos_translate
+    _argos_checked = True
+    try:
+        from argostranslate import translate as argos_translate  # type: ignore
+        _argos_translate = argos_translate
+        logger.info("Argos Translate detected; local translation provider is available")
+    except Exception:
+        _argos_translate = None
+        if TRANSLATION_PROVIDER == "local":
+            logger.warning("TRANSLATION_PROVIDER=local requested, but argostranslate is not installed")
+    return _argos_translate
+
+
+def _local_language_codes() -> Set[str]:
+    argos_translate = _get_argos_translate()
+    if argos_translate is None:
+        return set()
+    try:
+        codes: Set[str] = set()
+        for language in argos_translate.get_installed_languages():
+            code = getattr(language, "code", None)
+            if isinstance(code, str):
+                codes.add(code)
+        return codes
+    except Exception:
+        return set()
+
+
+def _try_local_translate(text: str, source: str, target: str) -> Optional[str]:
+    if TRANSLATION_PROVIDER not in {"auto", "local", "argos"}:
+        return None
+    if not source or source == "auto":
+        return None
+    argos_translate = _get_argos_translate()
+    if argos_translate is None:
+        return None
+    try:
+        translated = argos_translate.translate(text, source, target)
+        translated = translated.strip() if isinstance(translated, str) else ""
+        return translated or None
+    except Exception as exc:
+        logger.debug("Local translation failed for %s -> %s: %s", source, target, exc)
+        return None
+
+
+async def _get_cached_translation(
+    key: Tuple[str, str, str, int],
+) -> Optional[Tuple[Dict[str, object], Optional[str]]]:
+    if TRANSLATION_CACHE_TTL <= 0 or TRANSLATION_CACHE_MAX <= 0:
+        return None
+    now = time.monotonic()
+    async with _translation_cache_lock:
+        cached = _translation_cache.get(key)
+        if not cached:
+            return None
+        expires_at, entry, detected = cached
+        if expires_at <= now:
+            _translation_cache.pop(key, None)
+            return None
+        return dict(entry), detected
+
+
+async def _set_cached_translation(
+    key: Tuple[str, str, str, int],
+    entry: Dict[str, object],
+    detected_language: Optional[str],
+) -> None:
+    if TRANSLATION_CACHE_TTL <= 0 or TRANSLATION_CACHE_MAX <= 0:
+        return
+    async with _translation_cache_lock:
+        if len(_translation_cache) >= TRANSLATION_CACHE_MAX:
+            oldest_key = min(_translation_cache, key=lambda item: _translation_cache[item][0])
+            _translation_cache.pop(oldest_key, None)
+        _translation_cache[key] = (
+            time.monotonic() + TRANSLATION_CACHE_TTL,
+            dict(entry),
+            detected_language,
+        )
+
+
+async def _translate_one(
+    text: str,
+    source_language: str | None,
+    target: str,
+    alternative_limit: int,
+) -> Tuple[str, Dict[str, object], Optional[str]]:
+    source = (source_language or "auto").strip() or "auto"
+    target = target.strip()
+    requested_alternatives = _coerce_alternative_limit(alternative_limit)
+    key = (text, source, target, requested_alternatives)
+
+    cached = await _get_cached_translation(key)
+    if cached:
+        entry, detected = cached
+        return target, entry, detected
+
+    if source != "auto" and source == target:
+        entry = {"primary": text, "alternatives": []}
+        await _set_cached_translation(key, entry, source)
+        return target, entry, source
+
+    local_text = _try_local_translate(text, source, target)
+    if local_text is not None:
+        entry = {"primary": local_text, "alternatives": []}
+        await _set_cached_translation(key, entry, source if source != "auto" else None)
+        return target, entry, source if source != "auto" else None
+
+    if TRANSLATION_PROVIDER in {"local", "argos"}:
+        entry = {"primary": "", "alternatives": []}
+        return target, entry, None
+
+    client = await _get_translation_client()
+    payload: Dict[str, object] = {
+        "q": text,
+        "source": source,
+        "target": target,
+        "format": "text",
+    }
+    if requested_alternatives > 0:
+        payload["alternatives"] = requested_alternatives
+
+    response = await client.post("/translate", json=payload)
+    response.raise_for_status()
+    data = response.json()
+    translated = str(data.get("translatedText", "")).strip()
+    alternatives = _normalize_translation_alternatives(data.get("alternatives"), translated)
+    detected = data.get("detectedLanguage")
+    detected_language = detected if isinstance(detected, str) else None
+    entry = {"primary": translated, "alternatives": alternatives}
+    await _set_cached_translation(key, entry, detected_language)
+    return target, entry, detected_language
+
+
 async def _translate_transcript(
     text: str,
     source_language: str | None,
@@ -170,56 +333,19 @@ async def _translate_transcript(
     if not unique_targets:
         return {}, None
 
-    requested_alternatives = _coerce_alternative_limit(alternative_limit)
-    client = await _get_translation_client()
-    payloads: List[Tuple[str, Dict[str, object]]] = []
-    for target in unique_targets:
-        payload: Dict[str, object] = {
-            "q": trimmed,
-            "source": source_language or "auto",
-            "target": target,
-            "format": "text",
-        }
-        if requested_alternatives > 0:
-            payload["alternatives"] = requested_alternatives
-        payloads.append((target, payload))
-
-    async def request(pair: Tuple[str, Dict[str, object]]):
-        target, payload = pair
+    async def request(target: str):
         try:
-            response = await client.post("/translate", json=payload)
-            response.raise_for_status()
-            data = response.json()
-            translated = str(data.get("translatedText", "")).strip()
-            raw_alternatives = data.get("alternatives")
-            alternatives: List[str] = []
-            if isinstance(raw_alternatives, list):
-                for entry in raw_alternatives:
-                    value = None
-                    if isinstance(entry, str):
-                        value = entry.strip()
-                    elif isinstance(entry, dict):
-                        for key in ("translatedText", "translation", "text", "value"):
-                            maybe = entry.get(key)
-                            if isinstance(maybe, str):
-                                value = maybe.strip()
-                                if value:
-                                    break
-                    if value and value not in alternatives:
-                        alternatives.append(value)
-            detected = data.get("detectedLanguage")
-            detected_language = detected if isinstance(detected, str) else None
-            return target, translated, alternatives, detected_language
+            return await _translate_one(trimmed, source_language, target, alternative_limit)
         except Exception as exc:  # pragma: no cover - network safeguard
             logger.warning("Translation request failed for %s: %s", target, exc)
-            return target, "", [], None
+            return target, {"primary": "", "alternatives": []}, None
 
-    results = await asyncio.gather(*(request(item) for item in payloads))
+    results = await asyncio.gather(*(request(target) for target in unique_targets))
 
     translations: Dict[str, Dict[str, object]] = {}
     detected_language: str | None = None
-    for target, primary, alternatives, detected in results:
-        translations[target] = {"primary": primary, "alternatives": alternatives}
+    for target, entry, detected in results:
+        translations[target] = entry
         if detected and not detected_language:
             detected_language = detected
 
@@ -1364,6 +1490,85 @@ async def shutdown_event() -> None:
 async def startup_event() -> None:
     # Start background cleanup task for idle room members
     asyncio.create_task(_room_cleanup_loop())
+
+
+@app.get("/healthz")
+async def healthz() -> Dict[str, object]:
+    return {
+        "ok": True,
+        "engine": "whisperlive",
+        "translationEnabled": TRANSLATION_ENABLED,
+        "translationProvider": TRANSLATION_PROVIDER,
+        "translationBase": TRANSLATION_BASE_URL,
+        "localTranslationAvailable": _get_argos_translate() is not None,
+        "localLanguages": sorted(_local_language_codes()),
+    }
+
+
+@app.post("/translate")
+async def translate_text(payload: Dict[str, object]) -> Dict[str, object]:
+    text = str(payload.get("q") or "").strip()
+    if not text:
+        return {"translatedText": "", "alternatives": []}
+
+    source = str(payload.get("source") or "auto").strip() or "auto"
+    target = str(payload.get("target") or "").strip()
+    targets = _parse_target_languages(payload.get("targets"))
+    alternative_limit = _coerce_alternative_limit(payload.get("alternatives"))
+
+    if targets:
+        translations, detected = await _translate_transcript(text, source, targets, alternative_limit)
+        return {"translations": translations, "detectedLanguage": detected}
+
+    if not target:
+        raise HTTPException(status_code=400, detail="target is required")
+
+    _, entry, detected = await _translate_one(text, source, target, alternative_limit)
+    return {
+        "translatedText": entry.get("primary", ""),
+        "alternatives": entry.get("alternatives", []),
+        "detectedLanguage": detected,
+    }
+
+
+@app.post("/detect")
+async def detect_language(payload: Dict[str, object]) -> List[Dict[str, object]]:
+    text = str(payload.get("q") or "").strip()
+    if not text:
+        return []
+    client = await _get_translation_client()
+    try:
+        response = await client.post("/detect", json={"q": text})
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, list) else []
+    except Exception as exc:
+        logger.warning("Language detection request failed: %s", exc)
+        return []
+
+
+@app.get("/languages")
+async def supported_languages() -> List[Dict[str, str]]:
+    local_codes = sorted(_local_language_codes())
+    if local_codes and TRANSLATION_PROVIDER in {"auto", "local", "argos"}:
+        return [{"code": code, "name": code} for code in local_codes]
+    client = await _get_translation_client()
+    try:
+        response = await client.get("/languages")
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list):
+            return [
+                {
+                    "code": str(item.get("code", "")),
+                    "name": str(item.get("name", item.get("code", ""))),
+                }
+                for item in data
+                if isinstance(item, dict) and item.get("code")
+            ]
+    except Exception as exc:
+        logger.warning("Language list request failed: %s", exc)
+    return []
 
 
 @app.post("/transcribe")
