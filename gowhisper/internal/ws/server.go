@@ -47,6 +47,7 @@ type clientMeta struct {
 	peerID    string
 	peerLabel string
 	channelID string
+	writeMu   *sync.Mutex
 }
 
 func NewServer(cfg config.Config) *Server {
@@ -80,6 +81,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 		engine  weng.Engine
 		samples []float32
 		seq     int
+		writeMu sync.Mutex
 
 		// Session configuration from start event
 		sourceLanguage          string
@@ -93,7 +95,21 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 		workerStarted    bool                  // track if background worker is running
 		samplesMu        sync.Mutex            // protect samples buffer and offset
 		exitWorker       = make(chan struct{}) // signal worker to exit
+		stopWorkerOnce   sync.Once
 	)
+	meta.writeMu = &writeMu
+
+	stopWorker := func() {
+		stopWorkerOnce.Do(func() {
+			close(exitWorker)
+		})
+	}
+
+	sendJSON := func(payload any) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return conn.WriteJSON(payload)
+	}
 
 	// channel to receive transcription results from async workers
 	type transcriptResult struct {
@@ -105,6 +121,60 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 		trans    map[string]any
 	}
 	resCh := make(chan transcriptResult, 16) // Buffer for parallel results
+	resultWriterDone := make(chan struct{})
+
+	writeTranscriptResult := func(r transcriptResult) {
+		payload := map[string]any{
+			"type":         "transcript",
+			"text":         r.delta,
+			"fullText":     r.full,
+			"language":     r.lang,
+			"isFinal":      r.isFinal,
+			"sequence":     r.sequence,
+			"translations": r.trans,
+		}
+		if err := sendJSON(payload); err != nil {
+			log.Warn().Err(err).Msg("failed to send transcript")
+		} else {
+			log.Debug().Str("delta", r.delta).Msg("sent transcript to client")
+		}
+
+		if roomID != "" {
+			rp := map[string]any{
+				"type":         "room_transcript",
+				"room_id":      roomID,
+				"peer_id":      meta.peerID,
+				"peer_label":   meta.peerLabel,
+				"channel_id":   meta.channelID,
+				"text":         r.delta,
+				"fullText":     r.full,
+				"language":     r.lang,
+				"isFinal":      r.isFinal,
+				"sequence":     r.sequence,
+				"translations": r.trans,
+			}
+			s.broadcast(roomID, conn, meta.peerID, rp)
+		}
+	}
+
+	go func() {
+		defer close(resultWriterDone)
+		for {
+			select {
+			case r := <-resCh:
+				writeTranscriptResult(r)
+			case <-exitWorker:
+				for {
+					select {
+					case r := <-resCh:
+						writeTranscriptResult(r)
+					default:
+						return
+					}
+				}
+			}
+		}
+	}()
 
 	// Background transcription worker - runs continuously like WhisperLive
 	// Processes new audio as it arrives, tracking offset to avoid re-processing
@@ -327,62 +397,14 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 
-	// Helper to drain any ready transcription results
-	drainResults := func() {
-		for {
-			select {
-			case r := <-resCh:
-				// Send to client
-				payload := map[string]any{
-					"type":         "transcript",
-					"text":         r.delta,
-					"fullText":     r.full,
-					"language":     r.lang,
-					"isFinal":      r.isFinal,
-					"sequence":     r.sequence,
-					"translations": r.trans,
-				}
-				if err := conn.WriteJSON(payload); err != nil {
-					log.Warn().Err(err).Msg("failed to send transcript")
-				} else {
-					log.Debug().Str("delta", r.delta).Msg("sent transcript to client")
-				}
-
-				// Broadcast to room if joined
-				if roomID != "" {
-					rp := map[string]any{
-						"type":         "room_transcript",
-						"room_id":      roomID,
-						"peer_id":      meta.peerID,
-						"peer_label":   meta.peerLabel,
-						"channel_id":   meta.channelID,
-						"text":         r.delta,
-						"fullText":     r.full,
-						"language":     r.lang,
-						"isFinal":      r.isFinal,
-						"sequence":     r.sequence,
-						"translations": r.trans,
-					}
-					s.broadcast(roomID, conn, meta.peerID, rp)
-				}
-
-				// Note: We do NOT reset buffer on automatic isFinal
-				// Buffer only resets when client sends explicit final marker
-				// This preserves context for continued speech
-			default:
-				return
-			}
-		}
-	} // Simple loop handling JSON control messages and chunk frames
+	// Simple loop handling JSON control messages and chunk frames.
 	for {
-		// First, drain any ready transcription results before reading next message
-		drainResults()
-
 		mt, data, err := conn.ReadMessage()
 		if err != nil {
 			if websocket.IsCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				s.leaveRoom(roomID, conn)
-				close(exitWorker) // Signal worker to exit
+				stopWorker()
+				<-resultWriterDone
 				if engine != nil {
 					_ = engine.Close()
 				}
@@ -390,7 +412,8 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			}
 			log.Warn().Err(err).Msg("ws read error")
 			s.leaveRoom(roomID, conn)
-			close(exitWorker) // Signal worker to exit
+			stopWorker()
+			<-resultWriterDone
 			if engine != nil {
 				_ = engine.Close()
 			}
@@ -403,14 +426,14 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 		}
 		var msg map[string]any
 		if err := json.Unmarshal(data, &msg); err != nil {
-			_ = conn.WriteJSON(map[string]any{"type": "error", "detail": "invalid json"})
+			_ = sendJSON(map[string]any{"type": "error", "detail": "invalid json"})
 			continue
 		}
 		switch msg["type"] {
 		case "ping":
 			// keepalive from client: reset deadline and respond
 			_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-			_ = conn.WriteJSON(map[string]any{"type": "pong", "ts": msg["ts"]})
+			_ = sendJSON(map[string]any{"type": "pong", "ts": msg["ts"]})
 		case "start":
 			// Capture session configuration
 			if v, ok := msg["channel_id"].(string); ok {
@@ -443,7 +466,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 				engine.SetLanguage(sourceLanguage)
 			}
 
-			_ = conn.WriteJSON(map[string]any{"type": "started"})
+			_ = sendJSON(map[string]any{"type": "started"})
 		case "join_room":
 			// Idempotent room join ack
 			rid, _ := msg["room_id"].(string)
@@ -458,11 +481,11 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			}
 			s.joinRoom(rid, conn, meta)
 			roomID = rid
-			_ = conn.WriteJSON(map[string]any{"type": "room_joined", "room_id": roomID, "peer_id": meta.peerID, "peer_label": meta.peerLabel})
+			_ = sendJSON(map[string]any{"type": "room_joined", "room_id": roomID, "peer_id": meta.peerID, "peer_label": meta.peerLabel})
 		case "leave_room":
 			s.leaveRoom(roomID, conn)
 			roomID = ""
-			_ = conn.WriteJSON(map[string]any{"type": "room_left"})
+			_ = sendJSON(map[string]any{"type": "room_left"})
 		case "chunk":
 			// Decode base64
 			b64, _ := msg["data"].(string)
@@ -473,7 +496,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			// Inflate audio (WAV or PCM16)
 			raw, err := base64.StdEncoding.DecodeString(b64)
 			if err != nil {
-				_ = conn.WriteJSON(map[string]any{"type": "error", "detail": "invalid base64 audio"})
+				_ = sendJSON(map[string]any{"type": "error", "detail": "invalid base64 audio"})
 				continue
 			}
 
@@ -489,7 +512,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			}
 			if err != nil {
 				log.Warn().Err(err).Msg("audio decode failed")
-				_ = conn.WriteJSON(map[string]any{"type": "error", "detail": "decode audio failed"})
+				_ = sendJSON(map[string]any{"type": "error", "detail": "decode audio failed"})
 				continue
 			}
 
@@ -537,7 +560,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 					log.Info().Str("language", sourceLanguage).Msg("whisper engine initialized successfully")
 				} else {
 					log.Error().Err(err).Msg("engine init failed")
-					_ = conn.WriteJSON(map[string]any{"type": "error", "detail": "engine init failed"})
+					_ = sendJSON(map[string]any{"type": "error", "detail": "engine init failed"})
 					continue
 				}
 			}
@@ -551,15 +574,16 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			}
 		case "stop":
 			// Acknowledge
-			_ = conn.WriteJSON(map[string]any{"type": "stopped"})
+			_ = sendJSON(map[string]any{"type": "stopped"})
 			s.leaveRoom(roomID, conn)
-			close(exitWorker) // Signal worker to exit
+			stopWorker()
+			<-resultWriterDone
 			if engine != nil {
 				_ = engine.Close()
 			}
 			return
 		default:
-			_ = conn.WriteJSON(map[string]any{"type": "error", "detail": "unknown message type"})
+			_ = sendJSON(map[string]any{"type": "error", "detail": "unknown message type"})
 		}
 	}
 }
@@ -569,13 +593,17 @@ func (s *Server) joinRoom(room string, c *websocket.Conn, meta *clientMeta) {
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	m := s.rooms[room]
 	if m == nil {
 		m = make(map[*websocket.Conn]*clientMeta)
 		s.rooms[room] = m
 	}
-	m[c] = &clientMeta{peerID: meta.peerID, peerLabel: meta.peerLabel, channelID: meta.channelID}
+	writeMu := meta.writeMu
+	if writeMu == nil {
+		writeMu = &sync.Mutex{}
+	}
+	m[c] = &clientMeta{peerID: meta.peerID, peerLabel: meta.peerLabel, channelID: meta.channelID, writeMu: writeMu}
+	s.mu.Unlock()
 	s.broadcastRoster(room)
 }
 
@@ -584,20 +612,23 @@ func (s *Server) leaveRoom(room string, c *websocket.Conn) {
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if m := s.rooms[room]; m != nil {
 		delete(m, c)
 		if len(m) == 0 {
 			delete(s.rooms, room)
 		}
 	}
+	s.mu.Unlock()
 	s.broadcastRoster(room)
 }
 
 func (s *Server) broadcast(room string, sender *websocket.Conn, senderPeerID string, payload map[string]any) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	m := s.rooms[room]
+	recipients := make([]struct {
+		conn *websocket.Conn
+		meta *clientMeta
+	}, 0, len(m))
 	for c, info := range m {
 		if c == sender {
 			continue
@@ -605,7 +636,15 @@ func (s *Server) broadcast(room string, sender *websocket.Conn, senderPeerID str
 		if info != nil && senderPeerID != "" && info.peerID == senderPeerID {
 			continue
 		}
-		_ = c.WriteJSON(payload)
+		recipients = append(recipients, struct {
+			conn *websocket.Conn
+			meta *clientMeta
+		}{conn: c, meta: info})
+	}
+	s.mu.RUnlock()
+
+	for _, recipient := range recipients {
+		writeJSON(recipient.conn, recipient.meta, payload)
 	}
 }
 
@@ -613,6 +652,10 @@ func (s *Server) broadcastRoster(room string) {
 	s.mu.RLock()
 	m := s.rooms[room]
 	members := make([]map[string]any, 0, len(m))
+	recipients := make([]struct {
+		conn *websocket.Conn
+		meta *clientMeta
+	}, 0, len(m))
 	for _, info := range m {
 		if info == nil {
 			continue
@@ -623,13 +666,29 @@ func (s *Server) broadcastRoster(room string) {
 			"channel_id": info.channelID,
 		})
 	}
-	s.mu.RUnlock()
-	payload := map[string]any{"type": "room_roster", "members": members}
-	s.mu.RLock()
-	for c := range m {
-		_ = c.WriteJSON(payload)
+	for c, info := range m {
+		recipients = append(recipients, struct {
+			conn *websocket.Conn
+			meta *clientMeta
+		}{conn: c, meta: info})
 	}
 	s.mu.RUnlock()
+
+	payload := map[string]any{"type": "room_roster", "members": members}
+	for _, recipient := range recipients {
+		writeJSON(recipient.conn, recipient.meta, payload)
+	}
+}
+
+func writeJSON(c *websocket.Conn, meta *clientMeta, payload any) {
+	if c == nil {
+		return
+	}
+	if meta != nil && meta.writeMu != nil {
+		meta.writeMu.Lock()
+		defer meta.writeMu.Unlock()
+	}
+	_ = c.WriteJSON(payload)
 }
 
 func asFloat(v any) float64 {
