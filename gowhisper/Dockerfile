@@ -88,11 +88,15 @@ RUN ldconfig
 
 # Copy server binary
 COPY --from=builder /out/whisper-server /usr/local/bin/whisper-server
+COPY scripts/start-whisper.sh /usr/local/bin/start-whisper.sh
+RUN chmod +x /usr/local/bin/start-whisper.sh
 
 # Default configuration; override at runtime as needed
 # MODEL_NAME controls the expected model filename (ggml-${MODEL_NAME}.bin)
 ARG MODEL_NAME=base
 ENV WHISPER_GO_ADDR=:8080 \
+  WHISPER_MODEL_NAME=${MODEL_NAME} \
+  WHISPER_MODEL_DOWNLOAD=auto \
   WHISPER_MODEL_PATH=/models/ggml-${MODEL_NAME}.bin \
   WHISPER_THREADS=8 \
   LOG_LEVEL=info
@@ -103,4 +107,4 @@ RUN mkdir -p /models
 COPY --from=model /out/ /models/
 
 EXPOSE 8080
-CMD ["/usr/local/bin/whisper-server"]
+CMD ["/usr/local/bin/start-whisper.sh"]

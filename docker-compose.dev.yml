@@ -16,6 +16,8 @@ services:
       - ./gowhisper/models:/models
     environment:
       WHISPER_GO_ADDR: ":8080"
+      WHISPER_MODEL_NAME: "${MODEL_NAME:-base}"
+      WHISPER_MODEL_DOWNLOAD: "${WHISPER_MODEL_DOWNLOAD:-auto}"
       WHISPER_MODEL_PATH: "/models/ggml-${MODEL_NAME:-base}.bin"
       WHISPER_THREADS: "${WHISPER_THREADS:-8}"
       LOG_LEVEL: "${LOG_LEVEL:-info}"
