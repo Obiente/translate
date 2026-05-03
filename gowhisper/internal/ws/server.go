@@ -264,10 +264,11 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			const stableThreshold = 2          // Number of passes before marking as final
 			const autoFinalRepeatThreshold = 2 // Repeated identical transcript triggers a final
 			const workTick = 100 * time.Millisecond
-			const minStepSamples = 1600         // 100ms at 16kHz
-			const minInferenceSamples = 8000    // 500ms of audio before first real pass
-			const maxWindowSamples = 16000 * 8  // 8 seconds rolling utterance window
-			const keepRecentSamples = 16000 * 3 // 3 seconds context after a final
+			const minStepSamples = 1600              // 100ms at 16kHz for steady partial updates
+			const minLiveInferenceSamples = 6400     // 400ms before first live hypothesis
+			const minFinalizeInferenceSamples = 9600 // 600ms before trusting finalize retry
+			const maxWindowSamples = 16000 * 8       // 8 seconds rolling utterance window
+			const keepRecentSamples = 16000 * 3      // 3 seconds context after a final
 
 			for {
 				select {
@@ -348,13 +349,17 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 				newDuration := float64(newSamplesCount) / 16000.0
 				windowRMS, windowPeak := audio.SignalStats(audioWithContext)
 
-				// Only process when enough new audio arrived, unless we're
-				// explicitly finalizing because the speaker stopped.
+				hasLiveHypothesis := strings.TrimSpace(fullTranscript) != "" || strings.TrimSpace(lastPartialText) != ""
+
+				// Keep feeding audio into Whisper while the speaker is talking so
+				// the UI can track the sentence in motion. We are stricter about
+				// the very first hypothesis than we are about updates to an
+				// existing live hypothesis.
 				if !finalizeRequested && newSamplesCount < minStepSamples {
 					time.Sleep(workTick)
 					continue
 				}
-				if !finalizeRequested && len(audioWithContext) < minInferenceSamples {
+				if !finalizeRequested && !hasLiveHypothesis && len(audioWithContext) < minLiveInferenceSamples {
 					time.Sleep(workTick)
 					continue
 				}
@@ -547,7 +552,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 					}
 
 					if finalizeRequested {
-						if (fullTranscript == "" || isBlankAudioText(fullTranscript)) && len(audioWithContext) >= minInferenceSamples {
+						if (fullTranscript == "" || isBlankAudioText(fullTranscript)) && len(audioWithContext) >= minFinalizeInferenceSamples {
 							_, retryFullText, retryLang, retryErr := engine.Process(audioWithContext)
 							if retryErr != nil {
 								log.Warn().Err(retryErr).Msg("worker: finalize retry process failed")
@@ -770,6 +775,20 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			if len(pcm) > 0 {
 				chunksReceived++
 				rms, peak := audio.SignalStats(pcm)
+				isSilentChunk := rms < 0.0005 && peak < 0.002
+				if isSilentChunk {
+					if chunksReceived == 1 || chunksReceived%20 == 0 {
+						log.Debug().
+							Int("chunks_received", chunksReceived).
+							Int("chunk_samples", len(pcm)).
+							Float64("rms", rms).
+							Float64("peak", peak).
+							Str("room_id", roomID).
+							Str("peer_id", meta.peerID).
+							Msg("dropping near-silent chunk")
+					}
+					continue
+				}
 				samplesMu.Lock()
 				samples = append(samples, pcm...)
 
