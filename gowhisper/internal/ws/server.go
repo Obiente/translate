@@ -92,13 +92,14 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 		translationAlternatives int
 
 		// Track transcription state
-		fullTranscript   string                // accumulated full transcription across all chunks
-		finalizedText    string                // text that has been marked as final (don't reset until client final)
-		processedSamples int                   // offset: how many samples have been transcribed
-		workerStarted    bool                  // track if background worker is running
-		samplesMu        sync.Mutex            // protect samples buffer and offset
-		exitWorker       = make(chan struct{}) // signal worker to exit
-		stopWorkerOnce   sync.Once
+		fullTranscript    string                // accumulated full transcription across all chunks
+		finalizedText     string                // text that has been marked as final (don't reset until client final)
+		processedSamples  int                   // offset: how many samples have been transcribed
+		workerStarted     bool                  // track if background worker is running
+		samplesMu         sync.Mutex            // protect samples buffer and offset
+		exitWorker        = make(chan struct{}) // signal worker to exit
+		stopWorkerOnce    sync.Once
+		finalizeRequested bool
 	)
 	meta.writeMu = &writeMu
 
@@ -208,7 +209,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			var lastStableText string
 			var stableTextCount int
 			const stableThreshold = 2 // Number of passes before marking as final
-			const workTick = 250 * time.Millisecond
+			const workTick = 150 * time.Millisecond
 
 			for {
 				select {
@@ -220,6 +221,48 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 				// Get new unprocessed audio
 				samplesMu.Lock()
 				if processedSamples >= len(samples) {
+					if finalizeRequested {
+						trimmed := strings.TrimSpace(fullTranscript)
+						if trimmed != "" && trimmed != finalizedText {
+							result := transcriptResult{
+								delta:    trimmed,
+								full:     trimmed,
+								lang:     sourceLanguage,
+								isFinal:  true,
+								sequence: seq,
+								trans:    map[string]any{},
+							}
+							if result.lang == "" {
+								result.lang = "en"
+							}
+
+							if s.cfg.TranslationEnabled && len(targetLanguages) > 0 {
+								ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.cfg.TranslationTimeoutSec)*time.Second)
+								alts := translationAlternatives
+								if alts < 0 {
+									alts = 0
+								}
+								if m, err := s.translator.Translate(ctx, result.delta, result.lang, targetLanguages, alts); err != nil {
+									log.Warn().Err(err).Str("delta", result.delta).Msg("worker: translation request failed")
+								} else if m != nil {
+									for k, v := range m {
+										result.trans[k] = v
+									}
+								}
+								cancel()
+							}
+
+							finalizedText = trimmed
+							finalizeRequested = false
+							log.Info().Str("text", trimmed).Msg("worker: forcing final transcript after speaker inactivity")
+							select {
+							case resCh <- result:
+							case <-time.After(1 * time.Second):
+							}
+						} else {
+							finalizeRequested = false
+						}
+					}
 					samplesMu.Unlock()
 					time.Sleep(workTick)
 					continue
@@ -227,8 +270,8 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 
 				// Process only a bounded recent window so we emit partials regularly
 				// instead of waiting on one long native streaming pass.
-				workWindowSamples := 16000 * 4    // 4 seconds of fresh audio
-				contextWindowSamples := 16000 * 3 // 3 seconds of immediate context
+				workWindowSamples := 16000 * 2    // 2 seconds of fresh audio
+				contextWindowSamples := 16000 * 2 // 2 seconds of immediate context
 				startOffset := processedSamples - contextWindowSamples
 				if startOffset < 0 {
 					startOffset = 0
@@ -248,7 +291,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 				newDuration := float64(newSamplesCount) / 16000.0
 
 				// Only process if we have meaningful new audio (>0.4s)
-				if newDuration < 0.4 {
+				if newDuration < 0.2 {
 					time.Sleep(workTick)
 					continue
 				}
@@ -387,6 +430,15 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 					}
 
 					// Send result
+					if finalizeRequested {
+						result.isFinal = true
+						result.delta = fullText
+						result.full = fullText
+						finalizedText = fullText
+						finalizeRequested = false
+						log.Info().Str("text", fullText).Msg("worker: promoting transcript to final after finalize request")
+					}
+
 					log.Debug().
 						Str("delta", result.delta).
 						Str("full", result.full[:min(100, len(result.full))]).
@@ -626,6 +678,9 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 				_ = engine.Close()
 			}
 			return
+		case "finalize":
+			finalizeRequested = true
+			_ = sendJSON(map[string]any{"type": "finalizing"})
 		default:
 			_ = sendJSON(map[string]any{"type": "error", "detail": "unknown message type"})
 		}
