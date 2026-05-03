@@ -254,6 +254,24 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			log.Info().Msg("transcription worker started")
 			defer log.Info().Msg("transcription worker stopped")
 
+			type inferenceRequest struct {
+				id                int64
+				totalSamples      int
+				audioWithContext  []float32
+				inferenceSamples  []float32
+				windowRMS         float64
+				windowPeak        float64
+				finalizeRequested bool
+			}
+
+			type inferenceResponse struct {
+				req          inferenceRequest
+				fullText     string
+				detectedLang string
+				err          error
+				elapsed      time.Duration
+			}
+
 			// Live utterance state: keep a revisable live suffix and a committed
 			// prefix, then only finalize when the transcript stabilizes or the
 			// speaker explicitly stops.
@@ -261,6 +279,9 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			var stableTextCount int
 			var repeatedTranscriptCount int
 			var lastRepeatedTranscript string
+			var nextRequestID int64
+			var inFlight bool
+			var pendingReq *inferenceRequest
 			const stableThreshold = 2          // Number of passes before marking as final
 			const autoFinalRepeatThreshold = 2 // Repeated identical transcript triggers a final
 			const workTick = 100 * time.Millisecond
@@ -271,10 +292,306 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			const maxWindowSamples = 16000 * 8           // 8 seconds rolling utterance window
 			const keepRecentSamples = 16000 * 3          // 3 seconds context after a final
 
+			reqCh := make(chan inferenceRequest, 1)
+			respCh := make(chan inferenceResponse, 1)
+
+			go func() {
+				for {
+					select {
+					case <-exitWorker:
+						return
+					case req := <-reqCh:
+						started := time.Now()
+						_, fullText, detectedLang, err := engine.Process(req.inferenceSamples)
+						resp := inferenceResponse{
+							req:          req,
+							fullText:     strings.TrimSpace(fullText),
+							detectedLang: detectedLang,
+							err:          err,
+							elapsed:      time.Since(started),
+						}
+						select {
+						case respCh <- resp:
+						case <-exitWorker:
+							return
+						}
+					}
+				}
+			}()
+
+			dispatchRequest := func(req inferenceRequest) {
+				inFlight = true
+				select {
+				case reqCh <- req:
+				case <-exitWorker:
+				}
+			}
+
 			for {
 				select {
 				case <-exitWorker:
 					return
+				case resp := <-respCh:
+					inFlight = false
+					if resp.err != nil {
+						log.Warn().
+							Err(resp.err).
+							Dur("elapsed", resp.elapsed).
+							Int64("request_id", resp.req.id).
+							Msg("worker: process failed")
+						if pendingReq != nil {
+							req := *pendingReq
+							pendingReq = nil
+							dispatchRequest(req)
+						}
+						continue
+					}
+
+					log.Debug().
+						Dur("elapsed", resp.elapsed).
+						Int("samples", len(resp.req.inferenceSamples)).
+						Bool("finalize", resp.req.finalizeRequested).
+						Int64("request_id", resp.req.id).
+						Msg("worker: inference complete")
+
+					// Build result
+					result := transcriptResult{
+						lang:     resp.detectedLang,
+						isFinal:  false,
+						sequence: seq,
+						trans:    map[string]any{},
+					}
+					if result.lang == "" {
+						result.lang = "en"
+					}
+
+					fullText := resp.fullText
+					inferenceDuration := float64(len(resp.req.inferenceSamples)) / 16000.0
+					speechLike := isSpeechLikeWindow(inferenceDuration, resp.req.windowRMS, resp.req.windowPeak)
+					if isBlankAudioText(fullText) {
+						if speechLike {
+							log.Warn().
+								Float64("duration_sec", inferenceDuration).
+								Float64("rms", resp.req.windowRMS).
+								Float64("peak", resp.req.windowPeak).
+								Str("lang", result.lang).
+								Msg("worker: suppressing [BLANK_AUDIO] for speech-like audio window")
+							if resp.req.finalizeRequested {
+								candidate := strings.TrimSpace(joinTranscript(confirmedPrefix, lastPartialText))
+								if candidate != "" && !isBlankAudioText(candidate) {
+									fullTranscript = candidate
+									fullText = lastPartialText
+								} else {
+									finalizeRequested = false
+									dumpCurrentAudio("blank_suppressed")
+									lastSampleCount = resp.req.totalSamples
+									if pendingReq != nil {
+										req := *pendingReq
+										pendingReq = nil
+										dispatchRequest(req)
+									}
+									continue
+								}
+							} else {
+								lastSampleCount = resp.req.totalSamples
+								if pendingReq != nil {
+									req := *pendingReq
+									pendingReq = nil
+									dispatchRequest(req)
+								}
+								continue
+							}
+						}
+					}
+
+					if fullText != "" {
+						prevFull := fullTranscript
+						prevFinalized := finalizedText
+						prevLive := lastPartialText
+
+						liveText := stripCommittedPrefix(fullText, confirmedPrefix)
+						fullText = strings.TrimSpace(liveText)
+						if fullText == "" && !resp.req.finalizeRequested {
+							lastSampleCount = resp.req.totalSamples
+							if pendingReq != nil {
+								req := *pendingReq
+								pendingReq = nil
+								dispatchRequest(req)
+							}
+							continue
+						}
+
+						liveMerged := mergeRollingTranscript(prevLive, fullText)
+						fullTranscript = joinTranscript(confirmedPrefix, liveMerged)
+
+						result.delta = computeTextDelta(prevFull, fullTranscript)
+						result.full = fullTranscript
+
+						sentenceEndings := []rune{'.', '!', '?', '。', '！', '？', '♪', '*', ']', ')'}
+						lastSentenceEndPos := -1
+						for i := len(fullTranscript) - 1; i >= 0; i-- {
+							for _, ch := range sentenceEndings {
+								if rune(fullTranscript[i]) == ch {
+									lastSentenceEndPos = i
+									break
+								}
+							}
+							if lastSentenceEndPos >= 0 {
+								break
+							}
+						}
+
+						if lastSentenceEndPos >= 0 {
+							completedSentence := fullTranscript[:lastSentenceEndPos+1]
+							if prevFinalized == "" || !strings.HasPrefix(completedSentence, prevFinalized) || len(completedSentence) > len(prevFinalized) {
+								if completedSentence == lastStableText {
+									stableTextCount++
+									log.Debug().
+										Int("stable_count", stableTextCount).
+										Str("stable_sentence", completedSentence[max(0, len(completedSentence)-50):]).
+										Msg("worker: completed sentence stability detected")
+								} else {
+									stableTextCount = 1
+									lastStableText = completedSentence
+								}
+
+								if stableTextCount >= stableThreshold {
+									result.isFinal = true
+									finalizedText = completedSentence
+									confirmedPrefix = completedSentence
+									result.delta = completedSentence
+									result.full = completedSentence
+									log.Info().
+										Int("stable_count", stableTextCount).
+										Str("final_sentence", completedSentence).
+										Int("sentence_length", len(completedSentence)).
+										Msg("worker: emitting automatic isFinal (sentence stabilized)")
+									stableTextCount = 0
+									lastStableText = ""
+								}
+							}
+						} else if lastStableText != "" {
+							log.Debug().Msg("worker: no sentence ending found, resetting stability")
+							lastStableText = ""
+							stableTextCount = 0
+						}
+
+						if fullTranscript != "" && fullTranscript == lastRepeatedTranscript {
+							repeatedTranscriptCount++
+						} else {
+							repeatedTranscriptCount = 1
+							lastRepeatedTranscript = fullTranscript
+						}
+
+						if !result.isFinal && repeatedTranscriptCount >= autoFinalRepeatThreshold {
+							result.isFinal = true
+							finalizedText = fullTranscript
+							confirmedPrefix = ""
+							repeatedTranscriptCount = 0
+							lastRepeatedTranscript = ""
+							log.Info().Str("text", fullTranscript).Msg("worker: auto-final triggered by repeated transcript")
+						}
+
+						shouldTranslate := s.cfg.TranslationEnabled &&
+							len(targetLanguages) > 0 &&
+							result.delta != "" &&
+							(result.isFinal || s.cfg.TranslatePartials)
+						if shouldTranslate {
+							ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.cfg.TranslationTimeoutSec)*time.Second)
+							alts := translationAlternatives
+							if alts < 0 {
+								alts = 0
+							}
+							if m, err := s.translator.Translate(ctx, result.delta, result.lang, targetLanguages, alts); err != nil {
+								log.Warn().Err(err).Str("delta", result.delta).Msg("worker: translation request failed")
+							} else if m == nil || len(m) == 0 {
+								log.Debug().Str("delta", result.delta).Msg("worker: translation returned no results")
+							} else {
+								for k, v := range m {
+									result.trans[k] = v
+								}
+							}
+							cancel()
+						}
+
+						if resp.req.finalizeRequested {
+							if (fullTranscript == "" || isBlankAudioText(fullTranscript)) && len(resp.req.audioWithContext) >= minFinalizeInferenceSamples {
+								_, retryFullText, retryLang, retryErr := engine.Process(resp.req.audioWithContext)
+								if retryErr != nil {
+									log.Warn().Err(retryErr).Msg("worker: finalize retry process failed")
+								} else {
+									retryFullText = strings.TrimSpace(retryFullText)
+									if retryFullText != "" && !isBlankAudioText(retryFullText) {
+										retryLive := stripCommittedPrefix(retryFullText, confirmedPrefix)
+										fullTranscript = joinTranscript(confirmedPrefix, mergeRollingTranscript(lastPartialText, retryLive))
+										result.lang = retryLang
+										if result.lang == "" {
+											result.lang = "en"
+										}
+										log.Info().
+											Str("text", retryFullText).
+											Str("lang", result.lang).
+											Msg("worker: finalize retry recovered non-blank transcript")
+									}
+								}
+							}
+
+							result.isFinal = true
+							result.delta = fullTranscript
+							result.full = fullTranscript
+							finalizedText = fullTranscript
+							finalizeRequested = false
+							dumpCurrentAudio("finalize_request")
+							log.Info().Str("text", fullTranscript).Msg("worker: promoting transcript to final after finalize request")
+						}
+
+						log.Debug().
+							Str("delta", result.delta).
+							Str("full", result.full[:min(100, len(result.full))]).
+							Bool("is_final", result.isFinal).
+							Int("delta_len", len(result.delta)).
+							Int("full_len", len(result.full)).
+							Msg("worker: sending result")
+						select {
+						case resCh <- result:
+						case <-time.After(1 * time.Second):
+						}
+
+						if result.isFinal {
+							samplesMu.Lock()
+							if len(samples) > keepRecentSamples {
+								samples = append([]float32(nil), samples[len(samples)-keepRecentSamples:]...)
+							} else {
+								samples = append([]float32(nil), samples...)
+							}
+							samplesMu.Unlock()
+							lastPartialText = ""
+							fullTranscript = ""
+							finalizedText = ""
+							confirmedPrefix = ""
+							lastSampleCount = 0
+							repeatedTranscriptCount = 0
+							lastRepeatedTranscript = ""
+						} else {
+							lastPartialText = fullText
+							lastSampleCount = resp.req.totalSamples
+						}
+					} else {
+						lastSampleCount = resp.req.totalSamples
+					}
+
+					log.Debug().
+						Int("last_sample_count", lastSampleCount).
+						Str("full_text", fullTranscript).
+						Bool("is_final", result.isFinal).
+						Msg("worker: chunk complete")
+
+					if pendingReq != nil {
+						req := *pendingReq
+						pendingReq = nil
+						dispatchRequest(req)
+					}
+					continue
 				default:
 				}
 
@@ -373,265 +690,27 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 					Float64("new_duration", newDuration).
 					Msg("worker: processing audio with context")
 
-				// Use a small recent window for live partials so we keep the UI moving.
-				// Finals still retry against the fuller utterance buffer.
 				inferenceSamples := audioWithContext
 				if !finalizeRequested && len(inferenceSamples) > liveInferenceWindowSamples {
 					inferenceSamples = inferenceSamples[len(inferenceSamples)-liveInferenceWindowSamples:]
 				}
 
-				// Process a bounded batch with context.
-				_, fullText, detectedLang, err := engine.Process(inferenceSamples)
-				if err != nil {
-					log.Warn().Err(err).Msg("worker: process failed")
-					time.Sleep(workTick)
-					continue
+				nextRequestID++
+				req := inferenceRequest{
+					id:                nextRequestID,
+					totalSamples:      totalSamples,
+					audioWithContext:  append([]float32(nil), audioWithContext...),
+					inferenceSamples:  append([]float32(nil), inferenceSamples...),
+					windowRMS:         windowRMS,
+					windowPeak:        windowPeak,
+					finalizeRequested: finalizeRequested,
 				}
 
-				// Build result
-				result := transcriptResult{
-					lang:     detectedLang,
-					isFinal:  false,
-					sequence: seq,
-					trans:    map[string]any{},
-				}
-				if result.lang == "" {
-					result.lang = "en"
-				}
-
-				fullText = strings.TrimSpace(fullText)
-				inferenceDuration := float64(len(inferenceSamples)) / 16000.0
-				speechLike := isSpeechLikeWindow(inferenceDuration, windowRMS, windowPeak)
-				if isBlankAudioText(fullText) {
-					if speechLike {
-						log.Warn().
-							Float64("duration_sec", inferenceDuration).
-							Float64("rms", windowRMS).
-							Float64("peak", windowPeak).
-							Str("lang", result.lang).
-							Msg("worker: suppressing [BLANK_AUDIO] for speech-like audio window")
-						if finalizeRequested {
-							// Keep the last non-blank live hypothesis if we have one;
-							// otherwise ignore the blank and wait for more evidence.
-							candidate := strings.TrimSpace(joinTranscript(confirmedPrefix, lastPartialText))
-							if candidate != "" && !isBlankAudioText(candidate) {
-								fullTranscript = candidate
-								fullText = lastPartialText
-							} else {
-								finalizeRequested = false
-								dumpCurrentAudio("blank_suppressed")
-								lastSampleCount = totalSamples
-								time.Sleep(workTick)
-								continue
-							}
-						} else {
-							lastSampleCount = totalSamples
-							time.Sleep(workTick)
-							continue
-						}
-					}
-				}
-				if fullText != "" {
-					prevFull := fullTranscript
-					prevFinalized := finalizedText
-					prevLive := lastPartialText
-
-					liveText := stripCommittedPrefix(fullText, confirmedPrefix)
-					fullText = strings.TrimSpace(liveText)
-					if fullText == "" && !finalizeRequested {
-						lastSampleCount = totalSamples
-						time.Sleep(workTick)
-						continue
-					}
-
-					liveMerged := mergeRollingTranscript(prevLive, fullText)
-					fullTranscript = joinTranscript(confirmedPrefix, liveMerged)
-
-					// Calculate delta: new text since last emission (excluding already finalized)
-					result.delta = computeTextDelta(prevFull, fullTranscript)
-					result.full = fullTranscript
-
-					// Automatic isFinal detection: find the last complete sentence and check if IT has stabilized
-					// This allows emitting final during long speeches when individual sentences complete
-
-					// Find the position of the last sentence-ending punctuation
-					sentenceEndings := []rune{'.', '!', '?', '。', '！', '？', '♪', '*', ']', ')'}
-					lastSentenceEndPos := -1
-					for i := len(fullTranscript) - 1; i >= 0; i-- {
-						for _, ch := range sentenceEndings {
-							if rune(fullTranscript[i]) == ch {
-								lastSentenceEndPos = i
-								break
-							}
-						}
-						if lastSentenceEndPos >= 0 {
-							break
-						}
-					}
-
-					// If we found a sentence ending, extract up to and including that ending
-					if lastSentenceEndPos >= 0 {
-						// Extract the text up to the sentence ending (this is the "complete sentence")
-						completedSentence := fullTranscript[:lastSentenceEndPos+1]
-
-						// Only track sentences that are NEW (not already finalized)
-						if prevFinalized == "" || !strings.HasPrefix(completedSentence, prevFinalized) || len(completedSentence) > len(prevFinalized) {
-							// Check if this completed sentence has stabilized
-							if completedSentence == lastStableText {
-								stableTextCount++
-								log.Debug().
-									Int("stable_count", stableTextCount).
-									Str("stable_sentence", completedSentence[max(0, len(completedSentence)-50):]).
-									Msg("worker: completed sentence stability detected")
-							} else {
-								// Sentence changed, update tracking
-								stableTextCount = 1
-								lastStableText = completedSentence
-							}
-
-							// Mark as final if the completed sentence hasn't changed over multiple passes
-							if stableTextCount >= stableThreshold {
-								result.isFinal = true
-								finalizedText = completedSentence // Store what we've finalized
-								confirmedPrefix = completedSentence
-
-								// For sentence-level finals, send the completed sentence as text (not delta)
-								// This matches WhisperLive behavior for sentence finals
-								result.delta = completedSentence
-								result.full = completedSentence
-
-								log.Info().
-									Int("stable_count", stableTextCount).
-									Str("final_sentence", completedSentence).
-									Int("sentence_length", len(completedSentence)).
-									Msg("worker: emitting automatic isFinal (sentence stabilized)")
-								// Reset stability tracking after emitting final
-								stableTextCount = 0
-								lastStableText = ""
-							}
-						}
-					} else {
-						// No sentence ending found yet, reset tracking
-						if lastStableText != "" {
-							log.Debug().Msg("worker: no sentence ending found, resetting stability")
-							lastStableText = ""
-							stableTextCount = 0
-						}
-					}
-
-					if fullTranscript != "" && fullTranscript == lastRepeatedTranscript {
-						repeatedTranscriptCount++
-					} else {
-						repeatedTranscriptCount = 1
-						lastRepeatedTranscript = fullTranscript
-					}
-
-					if !result.isFinal && repeatedTranscriptCount >= autoFinalRepeatThreshold {
-						result.isFinal = true
-						finalizedText = fullTranscript
-						confirmedPrefix = ""
-						repeatedTranscriptCount = 0
-						lastRepeatedTranscript = ""
-						log.Info().Str("text", fullTranscript).Msg("worker: auto-final triggered by repeated transcript")
-					}
-
-					// Partial translations are optional. To keep the room feeling live,
-					// default to translating only finals unless explicitly enabled.
-					shouldTranslate := s.cfg.TranslationEnabled &&
-						len(targetLanguages) > 0 &&
-						result.delta != "" &&
-						(result.isFinal || s.cfg.TranslatePartials)
-					if shouldTranslate {
-						ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.cfg.TranslationTimeoutSec)*time.Second)
-						alts := translationAlternatives
-						if alts < 0 {
-							alts = 0
-						}
-						// Pass source language hint (if available) to the translation service
-						if m, err := s.translator.Translate(ctx, result.delta, result.lang, targetLanguages, alts); err != nil {
-							log.Warn().Err(err).Str("delta", result.delta).Msg("worker: translation request failed")
-						} else if m == nil || len(m) == 0 {
-							log.Debug().Str("delta", result.delta).Msg("worker: translation returned no results")
-						} else {
-							for k, v := range m {
-								result.trans[k] = v
-							}
-						}
-						cancel()
-					}
-
-					if finalizeRequested {
-						if (fullTranscript == "" || isBlankAudioText(fullTranscript)) && len(audioWithContext) >= minFinalizeInferenceSamples {
-							_, retryFullText, retryLang, retryErr := engine.Process(audioWithContext)
-							if retryErr != nil {
-								log.Warn().Err(retryErr).Msg("worker: finalize retry process failed")
-							} else {
-								retryFullText = strings.TrimSpace(retryFullText)
-								if retryFullText != "" && !isBlankAudioText(retryFullText) {
-									retryLive := stripCommittedPrefix(retryFullText, confirmedPrefix)
-									fullTranscript = joinTranscript(confirmedPrefix, mergeRollingTranscript(lastPartialText, retryLive))
-									result.lang = retryLang
-									if result.lang == "" {
-										result.lang = "en"
-									}
-									log.Info().
-										Str("text", retryFullText).
-										Str("lang", result.lang).
-										Msg("worker: finalize retry recovered non-blank transcript")
-								}
-							}
-						}
-
-						result.isFinal = true
-						result.delta = fullTranscript
-						result.full = fullTranscript
-						finalizedText = fullTranscript
-						finalizeRequested = false
-						dumpCurrentAudio("finalize_request")
-						log.Info().Str("text", fullTranscript).Msg("worker: promoting transcript to final after finalize request")
-					}
-
-					// Send result
-					log.Debug().
-						Str("delta", result.delta).
-						Str("full", result.full[:min(100, len(result.full))]).
-						Bool("is_final", result.isFinal).
-						Int("delta_len", len(result.delta)).
-						Int("full_len", len(result.full)).
-						Msg("worker: sending result")
-					select {
-					case resCh <- result:
-					case <-time.After(1 * time.Second):
-					}
-
-					if result.isFinal {
-						samplesMu.Lock()
-						if len(samples) > keepRecentSamples {
-							samples = append([]float32(nil), samples[len(samples)-keepRecentSamples:]...)
-						} else {
-							samples = append([]float32(nil), samples...)
-						}
-						samplesMu.Unlock()
-						lastPartialText = ""
-						fullTranscript = ""
-						finalizedText = ""
-						confirmedPrefix = ""
-						lastSampleCount = 0
-						repeatedTranscriptCount = 0
-						lastRepeatedTranscript = ""
-					} else {
-						lastPartialText = fullText
-						lastSampleCount = totalSamples
-					}
+				if !inFlight {
+					dispatchRequest(req)
 				} else {
-					lastSampleCount = totalSamples
+					pendingReq = &req
 				}
-
-				log.Debug().
-					Int("last_sample_count", lastSampleCount).
-					Str("full_text", fullTranscript).
-					Bool("is_final", result.isFinal).
-					Msg("worker: chunk complete")
 
 				time.Sleep(workTick)
 			}
