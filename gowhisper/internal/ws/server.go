@@ -76,12 +76,14 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 
 	// session state
 	var (
-		roomID  string
-		meta    = &clientMeta{}
-		engine  weng.Engine
-		samples []float32
-		seq     int
-		writeMu sync.Mutex
+		roomID         string
+		meta           = &clientMeta{}
+		engine         weng.Engine
+		samples        []float32
+		seq            int
+		chunksReceived int
+		resultsSent    int
+		writeMu        sync.Mutex
 
 		// Session configuration from start event
 		sourceLanguage          string
@@ -124,6 +126,18 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 	resultWriterDone := make(chan struct{})
 
 	writeTranscriptResult := func(r transcriptResult) {
+		resultsSent++
+		if resultsSent == 1 || resultsSent%10 == 0 {
+			log.Info().
+				Int("results_sent", resultsSent).
+				Bool("is_final", r.isFinal).
+				Int("delta_len", len(r.delta)).
+				Int("full_len", len(r.full)).
+				Str("room_id", roomID).
+				Str("peer_id", meta.peerID).
+				Msg("ws transcript emitted")
+		}
+
 		payload := map[string]any{
 			"type":         "transcript",
 			"text":         r.delta,
@@ -481,6 +495,12 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			}
 			s.joinRoom(rid, conn, meta)
 			roomID = rid
+			log.Info().
+				Str("room_id", roomID).
+				Str("peer_id", meta.peerID).
+				Str("peer_label", meta.peerLabel).
+				Str("channel_id", meta.channelID).
+				Msg("ws room joined")
 			_ = sendJSON(map[string]any{"type": "room_joined", "room_id": roomID, "peer_id": meta.peerID, "peer_label": meta.peerLabel})
 		case "leave_room":
 			s.leaveRoom(roomID, conn)
@@ -525,6 +545,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 
 			// Append to session buffer
 			if len(pcm) > 0 {
+				chunksReceived++
 				samplesMu.Lock()
 				samples = append(samples, pcm...)
 
@@ -545,7 +566,17 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 				}
 				samplesMu.Unlock()
 
-				log.Debug().Int("chunk_samples", len(pcm)).Int("total_samples", len(samples)).Float64("duration_sec", float64(len(samples))/16000.0).Msg("audio chunk received")
+				if chunksReceived == 1 || chunksReceived%20 == 0 {
+					log.Info().
+						Int("chunks_received", chunksReceived).
+						Int("chunk_samples", len(pcm)).
+						Int("total_samples", len(samples)).
+						Float64("duration_sec", float64(len(samples))/16000.0).
+						Str("room_id", roomID).
+						Str("peer_id", meta.peerID).
+						Str("channel_id", meta.channelID).
+						Msg("ws audio chunk received")
+				}
 			}
 
 			// Lazy engine init

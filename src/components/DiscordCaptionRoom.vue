@@ -12,13 +12,19 @@
     </section>
 
     <section class="discord-room__hero">
-      <div>
+      <div class="discord-room__hero-copy">
         <span class="eyebrow">Discord live captions</span>
         <h1>{{ latestLine || "Waiting for speech" }}</h1>
-        <p>
-          Room <code>{{ sessionId }}</code>
-          <span v-if="speakerCount">· {{ speakerCount }} speakers connected</span>
-        </p>
+        <div class="discord-room__meta">
+          <p>
+            <span class="meta-label">Room</span>
+            <code>{{ sessionId }}</code>
+          </p>
+          <p>
+            <span class="meta-label">Listeners</span>
+            <strong>{{ speakerCount || 0 }}</strong>
+          </p>
+        </div>
       </div>
       <aside v-if="sessionStatus" class="discord-room__session">
         <span>Bot session</span>
@@ -50,8 +56,13 @@
       </article>
 
       <div class="discord-room__empty" v-if="!speakerCards.length">
-        <span class="pulse-ring" aria-hidden="true"></span>
-        <p>{{ emptyStateMessage }}</p>
+        <div class="discord-room__empty-orb">
+          <span class="pulse-ring" aria-hidden="true"></span>
+        </div>
+        <div class="discord-room__empty-copy">
+          <strong>Live room is ready</strong>
+          <p>{{ emptyStateMessage }}</p>
+        </div>
       </div>
     </section>
 
