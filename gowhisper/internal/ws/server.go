@@ -92,11 +92,13 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 		translationAlternatives int
 
 		// Track transcription state
-		fullTranscript    string                // accumulated full transcription across all chunks
-		finalizedText     string                // text that has been marked as final (don't reset until client final)
-		processedSamples  int                   // offset: how many samples have been transcribed
+		fullTranscript    string                // current utterance transcript
+		finalizedText     string                // text already finalized for current utterance
+		confirmedPrefix   string                // confirmed sentence prefix retained across recalculations
+		lastPartialText   string                // most recent live text tail
+		lastSampleCount   int                   // sample count at last inference pass
 		workerStarted     bool                  // track if background worker is running
-		samplesMu         sync.Mutex            // protect samples buffer and offset
+		samplesMu         sync.Mutex            // protect samples buffer
 		exitWorker        = make(chan struct{}) // signal worker to exit
 		stopWorkerOnce    sync.Once
 		finalizeRequested bool
@@ -208,8 +210,14 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			// Automatic isFinal detection based on text stability (like WhisperLive)
 			var lastStableText string
 			var stableTextCount int
-			const stableThreshold = 2 // Number of passes before marking as final
-			const workTick = 150 * time.Millisecond
+			var repeatedTranscriptCount int
+			var lastRepeatedTranscript string
+			const stableThreshold = 2          // Number of passes before marking as final
+			const autoFinalRepeatThreshold = 2 // Repeated identical transcript triggers a final
+			const workTick = 100 * time.Millisecond
+			const minStepSamples = 1600         // 100ms at 16kHz
+			const maxWindowSamples = 16000 * 8  // 8 seconds rolling utterance window
+			const keepRecentSamples = 16000 * 2 // 2 seconds context after a final
 
 			for {
 				select {
@@ -218,9 +226,11 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 				default:
 				}
 
-				// Get new unprocessed audio
+				// Work over a rolling utterance snapshot so we can revise captions
+				// as the sentence continues, similar to the Python path.
 				samplesMu.Lock()
-				if processedSamples >= len(samples) {
+				totalSamples := len(samples)
+				if totalSamples == 0 {
 					if finalizeRequested {
 						trimmed := strings.TrimSpace(fullTranscript)
 						if trimmed != "" && trimmed != finalizedText {
@@ -268,30 +278,26 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 
-				// Process only a bounded recent window so we emit partials regularly
-				// instead of waiting on one long native streaming pass.
-				workWindowSamples := 16000 * 2    // 2 seconds of fresh audio
-				contextWindowSamples := 16000 * 2 // 2 seconds of immediate context
-				startOffset := processedSamples - contextWindowSamples
-				if startOffset < 0 {
-					startOffset = 0
-				}
-				endOffset := processedSamples + workWindowSamples
-				if endOffset > len(samples) {
-					endOffset = len(samples)
+				newSamplesCount := totalSamples - lastSampleCount
+				if newSamplesCount < 0 {
+					newSamplesCount = totalSamples
 				}
 
-				// Extract CONTEXT + bounded NEW audio for transcription.
-				audioWithContext := make([]float32, endOffset-startOffset)
-				copy(audioWithContext, samples[startOffset:endOffset])
-				newSamplesCount := endOffset - processedSamples
+				startOffset := 0
+				if totalSamples > maxWindowSamples {
+					startOffset = totalSamples - maxWindowSamples
+				}
+
+				audioWithContext := make([]float32, totalSamples-startOffset)
+				copy(audioWithContext, samples[startOffset:totalSamples])
 				samplesMu.Unlock()
 
 				audioDuration := float64(len(audioWithContext)) / 16000.0
 				newDuration := float64(newSamplesCount) / 16000.0
 
-				// Only process if we have meaningful new audio (>0.4s)
-				if newDuration < 0.2 {
+				// Only process when enough new audio arrived, unless we're
+				// explicitly finalizing because the speaker stopped.
+				if !finalizeRequested && newSamplesCount < minStepSamples {
 					time.Sleep(workTick)
 					continue
 				}
@@ -299,7 +305,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 				log.Debug().
 					Int("new_samples", newSamplesCount).
 					Int("total_with_context", len(audioWithContext)).
-					Int("processed_offset", processedSamples).
+					Int("total_samples", totalSamples).
 					Float64("context_duration", audioDuration).
 					Float64("new_duration", newDuration).
 					Msg("worker: processing audio with context")
@@ -325,22 +331,45 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 
 				fullText = strings.TrimSpace(fullText)
 				if fullText != "" {
-					samplesMu.Lock()
 					prevFull := fullTranscript
 					prevFinalized := finalizedText
-					fullTranscript = fullText
-					samplesMu.Unlock()
+
+					// Strip the already-confirmed prefix from the raw text so the
+					// live tail can keep being revised without duplicating finals.
+					liveText := fullText
+					if confirmedPrefix != "" {
+						strippedPrefix := strings.TrimSpace(confirmedPrefix)
+						if strippedPrefix != "" && strings.HasPrefix(liveText, strippedPrefix) {
+							liveText = strings.TrimSpace(strings.TrimPrefix(liveText, strippedPrefix))
+						}
+					}
+					fullText = strings.TrimSpace(liveText)
+					if fullText == "" && !finalizeRequested {
+						lastSampleCount = totalSamples
+						time.Sleep(workTick)
+						continue
+					}
+
+					if confirmedPrefix != "" && fullText != "" {
+						fullTranscript = strings.TrimSpace(confirmedPrefix + " " + fullText)
+					} else if confirmedPrefix != "" {
+						fullTranscript = strings.TrimSpace(confirmedPrefix)
+					} else {
+						fullTranscript = fullText
+					}
 
 					// Calculate delta: new text since last emission (excluding already finalized)
-					if prevFull != "" && strings.HasPrefix(fullText, prevFull) {
-						result.delta = strings.TrimSpace(strings.TrimPrefix(fullText, prevFull))
-					} else if prevFinalized != "" && strings.HasPrefix(fullText, prevFinalized) {
+					if lastPartialText != "" && strings.HasPrefix(fullText, lastPartialText) {
+						result.delta = strings.TrimSpace(strings.TrimPrefix(fullText, lastPartialText))
+					} else if prevFinalized != "" && strings.HasPrefix(fullTranscript, prevFinalized) {
 						// If full text changed but still starts with finalized, delta is everything after finalized
-						result.delta = strings.TrimSpace(strings.TrimPrefix(fullText, prevFinalized))
+						result.delta = strings.TrimSpace(strings.TrimPrefix(fullTranscript, prevFinalized))
+					} else if prevFull != "" && strings.HasPrefix(fullTranscript, prevFull) {
+						result.delta = strings.TrimSpace(strings.TrimPrefix(fullTranscript, prevFull))
 					} else {
-						result.delta = fullText
+						result.delta = fullTranscript
 					}
-					result.full = fullText
+					result.full = fullTranscript
 
 					// Automatic isFinal detection: find the last complete sentence and check if IT has stabilized
 					// This allows emitting final during long speeches when individual sentences complete
@@ -348,9 +377,9 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 					// Find the position of the last sentence-ending punctuation
 					sentenceEndings := []rune{'.', '!', '?', '。', '！', '？', '♪', '*', ']', ')'}
 					lastSentenceEndPos := -1
-					for i := len(fullText) - 1; i >= 0; i-- {
+					for i := len(fullTranscript) - 1; i >= 0; i-- {
 						for _, ch := range sentenceEndings {
-							if rune(fullText[i]) == ch {
+							if rune(fullTranscript[i]) == ch {
 								lastSentenceEndPos = i
 								break
 							}
@@ -363,7 +392,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 					// If we found a sentence ending, extract up to and including that ending
 					if lastSentenceEndPos >= 0 {
 						// Extract the text up to the sentence ending (this is the "complete sentence")
-						completedSentence := fullText[:lastSentenceEndPos+1]
+						completedSentence := fullTranscript[:lastSentenceEndPos+1]
 
 						// Only track sentences that are NEW (not already finalized)
 						if prevFinalized == "" || !strings.HasPrefix(completedSentence, prevFinalized) || len(completedSentence) > len(prevFinalized) {
@@ -383,9 +412,8 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 							// Mark as final if the completed sentence hasn't changed over multiple passes
 							if stableTextCount >= stableThreshold {
 								result.isFinal = true
-								samplesMu.Lock()
 								finalizedText = completedSentence // Store what we've finalized
-								samplesMu.Unlock()
+								confirmedPrefix = completedSentence
 
 								// For sentence-level finals, send the completed sentence as text (not delta)
 								// This matches WhisperLive behavior for sentence finals
@@ -409,7 +437,25 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 							lastStableText = ""
 							stableTextCount = 0
 						}
-					} // Translations
+					}
+
+					if fullTranscript != "" && fullTranscript == lastRepeatedTranscript {
+						repeatedTranscriptCount++
+					} else {
+						repeatedTranscriptCount = 1
+						lastRepeatedTranscript = fullTranscript
+					}
+
+					if !result.isFinal && repeatedTranscriptCount >= autoFinalRepeatThreshold {
+						result.isFinal = true
+						finalizedText = fullTranscript
+						confirmedPrefix = ""
+						repeatedTranscriptCount = 0
+						lastRepeatedTranscript = ""
+						log.Info().Str("text", fullTranscript).Msg("worker: auto-final triggered by repeated transcript")
+					}
+
+					// Translations
 					if s.cfg.TranslationEnabled && len(targetLanguages) > 0 && result.delta != "" {
 						ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.cfg.TranslationTimeoutSec)*time.Second)
 						alts := translationAlternatives
@@ -429,16 +475,16 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 						cancel()
 					}
 
-					// Send result
 					if finalizeRequested {
 						result.isFinal = true
-						result.delta = fullText
-						result.full = fullText
-						finalizedText = fullText
+						result.delta = fullTranscript
+						result.full = fullTranscript
+						finalizedText = fullTranscript
 						finalizeRequested = false
-						log.Info().Str("text", fullText).Msg("worker: promoting transcript to final after finalize request")
+						log.Info().Str("text", fullTranscript).Msg("worker: promoting transcript to final after finalize request")
 					}
 
+					// Send result
 					log.Debug().
 						Str("delta", result.delta).
 						Str("full", result.full[:min(100, len(result.full))]).
@@ -450,14 +496,33 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 					case resCh <- result:
 					case <-time.After(1 * time.Second):
 					}
-				} // Update processed offset normally - buffer reset happens in drainResults
-				samplesMu.Lock()
-				processedSamples += newSamplesCount
-				samplesMu.Unlock()
+
+					if result.isFinal {
+						samplesMu.Lock()
+						if len(samples) > keepRecentSamples {
+							samples = append([]float32(nil), samples[len(samples)-keepRecentSamples:]...)
+						} else {
+							samples = append([]float32(nil), samples...)
+						}
+						samplesMu.Unlock()
+						lastPartialText = ""
+						fullTranscript = ""
+						finalizedText = ""
+						confirmedPrefix = ""
+						lastSampleCount = 0
+						repeatedTranscriptCount = 0
+						lastRepeatedTranscript = ""
+					} else {
+						lastPartialText = fullText
+						lastSampleCount = totalSamples
+					}
+				} else {
+					lastSampleCount = totalSamples
+				}
 
 				log.Debug().
-					Int("processed_samples", processedSamples).
-					Str("full_text", fullText).
+					Int("last_sample_count", lastSampleCount).
+					Str("full_text", fullTranscript).
 					Bool("is_final", result.isFinal).
 					Msg("worker: chunk complete")
 
@@ -621,11 +686,10 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 					// Discard oldest 30 seconds when buffer is full
 					discardSamples := 30 * 16000
 					samples = samples[discardSamples:]
-					// Adjust processed offset
-					if processedSamples > discardSamples {
-						processedSamples -= discardSamples
+					if lastSampleCount > discardSamples {
+						lastSampleCount -= discardSamples
 					} else {
-						processedSamples = 0
+						lastSampleCount = 0
 					}
 					log.Debug().Int("buffer_samples", len(samples)).Float64("buffer_seconds", float64(len(samples))/16000.0).Msg("trimmed buffer (rolling 90s window)")
 				}
