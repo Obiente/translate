@@ -254,17 +254,20 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			log.Info().Msg("transcription worker started")
 			defer log.Info().Msg("transcription worker stopped")
 
-			// Automatic isFinal detection based on text stability (like WhisperLive)
+			// Live utterance state: keep a revisable live suffix and a committed
+			// prefix, then only finalize when the transcript stabilizes or the
+			// speaker explicitly stops.
 			var lastStableText string
 			var stableTextCount int
 			var repeatedTranscriptCount int
 			var lastRepeatedTranscript string
 			const stableThreshold = 2          // Number of passes before marking as final
 			const autoFinalRepeatThreshold = 2 // Repeated identical transcript triggers a final
-			const workTick = 75 * time.Millisecond
-			const minStepSamples = 800          // 50ms at 16kHz
-			const maxWindowSamples = 16000 * 6  // 6 seconds rolling utterance window
-			const keepRecentSamples = 16000 * 2 // 2 seconds context after a final
+			const workTick = 100 * time.Millisecond
+			const minStepSamples = 1600         // 100ms at 16kHz
+			const minInferenceSamples = 8000    // 500ms of audio before first real pass
+			const maxWindowSamples = 16000 * 8  // 8 seconds rolling utterance window
+			const keepRecentSamples = 16000 * 3 // 3 seconds context after a final
 
 			for {
 				select {
@@ -310,11 +313,11 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 								cancel()
 							}
 
-						finalizedText = trimmed
-						finalizeRequested = false
-						dumpCurrentAudio("finalize_idle")
-						log.Info().Str("text", trimmed).Msg("worker: forcing final transcript after speaker inactivity")
-						select {
+							finalizedText = trimmed
+							finalizeRequested = false
+							dumpCurrentAudio("finalize_idle")
+							log.Info().Str("text", trimmed).Msg("worker: forcing final transcript after speaker inactivity")
+							select {
 							case resCh <- result:
 							case <-time.After(1 * time.Second):
 							}
@@ -351,6 +354,10 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 					time.Sleep(workTick)
 					continue
 				}
+				if !finalizeRequested && len(audioWithContext) < minInferenceSamples {
+					time.Sleep(workTick)
+					continue
+				}
 
 				log.Debug().
 					Int("new_samples", newSamplesCount).
@@ -380,8 +387,8 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 				}
 
 				fullText = strings.TrimSpace(fullText)
+				speechLike := isSpeechLikeWindow(audioDuration, windowRMS, windowPeak)
 				if isBlankAudioText(fullText) {
-					speechLike := audioDuration >= 0.75 && (windowRMS >= 0.004 || windowPeak >= 0.03)
 					if speechLike {
 						log.Warn().
 							Float64("duration_sec", audioDuration).
@@ -390,27 +397,32 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 							Str("lang", result.lang).
 							Msg("worker: suppressing [BLANK_AUDIO] for speech-like audio window")
 						if finalizeRequested {
-							finalizeRequested = false
-							dumpCurrentAudio("blank_suppressed")
+							// Keep the last non-blank live hypothesis if we have one;
+							// otherwise ignore the blank and wait for more evidence.
+							candidate := strings.TrimSpace(joinTranscript(confirmedPrefix, lastPartialText))
+							if candidate != "" && !isBlankAudioText(candidate) {
+								fullTranscript = candidate
+								fullText = lastPartialText
+							} else {
+								finalizeRequested = false
+								dumpCurrentAudio("blank_suppressed")
+								lastSampleCount = totalSamples
+								time.Sleep(workTick)
+								continue
+							}
+						} else {
+							lastSampleCount = totalSamples
+							time.Sleep(workTick)
+							continue
 						}
-						lastSampleCount = totalSamples
-						time.Sleep(workTick)
-						continue
 					}
 				}
 				if fullText != "" {
 					prevFull := fullTranscript
 					prevFinalized := finalizedText
+					prevLive := lastPartialText
 
-					// Strip the already-confirmed prefix from the raw text so the
-					// live tail can keep being revised without duplicating finals.
-					liveText := fullText
-					if confirmedPrefix != "" {
-						strippedPrefix := strings.TrimSpace(confirmedPrefix)
-						if strippedPrefix != "" && strings.HasPrefix(liveText, strippedPrefix) {
-							liveText = strings.TrimSpace(strings.TrimPrefix(liveText, strippedPrefix))
-						}
-					}
+					liveText := stripCommittedPrefix(fullText, confirmedPrefix)
 					fullText = strings.TrimSpace(liveText)
 					if fullText == "" && !finalizeRequested {
 						lastSampleCount = totalSamples
@@ -418,27 +430,11 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 						continue
 					}
 
-					if confirmedPrefix != "" && fullText != "" {
-						fullTranscript = strings.TrimSpace(confirmedPrefix + " " + fullText)
-					} else if confirmedPrefix != "" {
-						fullTranscript = strings.TrimSpace(confirmedPrefix)
-					} else if prevFull != "" {
-						fullTranscript = mergeRollingTranscript(prevFull, fullText)
-					} else {
-						fullTranscript = fullText
-					}
+					liveMerged := mergeRollingTranscript(prevLive, fullText)
+					fullTranscript = joinTranscript(confirmedPrefix, liveMerged)
 
 					// Calculate delta: new text since last emission (excluding already finalized)
-					if lastPartialText != "" && strings.HasPrefix(fullText, lastPartialText) {
-						result.delta = strings.TrimSpace(strings.TrimPrefix(fullText, lastPartialText))
-					} else if prevFinalized != "" && strings.HasPrefix(fullTranscript, prevFinalized) {
-						// If full text changed but still starts with finalized, delta is everything after finalized
-						result.delta = strings.TrimSpace(strings.TrimPrefix(fullTranscript, prevFinalized))
-					} else if prevFull != "" && strings.HasPrefix(fullTranscript, prevFull) {
-						result.delta = strings.TrimSpace(strings.TrimPrefix(fullTranscript, prevFull))
-					} else {
-						result.delta = fullTranscript
-					}
+					result.delta = computeTextDelta(prevFull, fullTranscript)
 					result.full = fullTranscript
 
 					// Automatic isFinal detection: find the last complete sentence and check if IT has stabilized
@@ -551,14 +547,15 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 					}
 
 					if finalizeRequested {
-						if (fullTranscript == "" || isBlankAudioText(fullTranscript)) && len(audioWithContext) >= 8000 {
+						if (fullTranscript == "" || isBlankAudioText(fullTranscript)) && len(audioWithContext) >= minInferenceSamples {
 							_, retryFullText, retryLang, retryErr := engine.Process(audioWithContext)
 							if retryErr != nil {
 								log.Warn().Err(retryErr).Msg("worker: finalize retry process failed")
 							} else {
 								retryFullText = strings.TrimSpace(retryFullText)
 								if retryFullText != "" && !isBlankAudioText(retryFullText) {
-									fullTranscript = retryFullText
+									retryLive := stripCommittedPrefix(retryFullText, confirmedPrefix)
+									fullTranscript = joinTranscript(confirmedPrefix, mergeRollingTranscript(lastPartialText, retryLive))
 									result.lang = retryLang
 									if result.lang == "" {
 										result.lang = "en"
@@ -967,6 +964,82 @@ func safeFileComponent(input string) string {
 func isBlankAudioText(text string) bool {
 	normalized := strings.ToUpper(strings.TrimSpace(text))
 	return normalized == "[BLANK_AUDIO]" || normalized == "BLANK_AUDIO"
+}
+
+func isSpeechLikeWindow(durationSec, rms, peak float64) bool {
+	return durationSec >= 0.75 && (rms >= 0.004 || peak >= 0.03)
+}
+
+func joinTranscript(prefix, tail string) string {
+	prefix = strings.TrimSpace(prefix)
+	tail = strings.TrimSpace(tail)
+	if prefix == "" {
+		return tail
+	}
+	if tail == "" {
+		return prefix
+	}
+	return strings.TrimSpace(prefix + " " + tail)
+}
+
+func stripCommittedPrefix(text, prefix string) string {
+	text = strings.TrimSpace(text)
+	prefix = strings.TrimSpace(prefix)
+	if text == "" || prefix == "" {
+		return text
+	}
+	if strings.HasPrefix(text, prefix) {
+		return strings.TrimSpace(strings.TrimPrefix(text, prefix))
+	}
+	matched := 0
+	for end := len(prefix); end > 0; end-- {
+		candidate := prefix[:end]
+		if strings.HasPrefix(text, candidate) {
+			matched = end
+			break
+		}
+	}
+	if matched > 0 {
+		return strings.TrimSpace(text[matched:])
+	}
+	return text
+}
+
+func computeTextDelta(previous, current string) string {
+	previous = strings.TrimSpace(previous)
+	current = strings.TrimSpace(current)
+	if current == "" {
+		return ""
+	}
+	if previous == "" {
+		return current
+	}
+	if strings.HasPrefix(current, previous) {
+		return strings.TrimSpace(strings.TrimPrefix(current, previous))
+	}
+
+	prevWords := strings.Fields(previous)
+	currWords := strings.Fields(current)
+	bestWords := 0
+	maxWordOverlap := min(len(prevWords), len(currWords))
+	for overlap := maxWordOverlap; overlap >= 1; overlap-- {
+		match := true
+		for i := 0; i < overlap; i++ {
+			if !strings.EqualFold(prevWords[len(prevWords)-overlap+i], currWords[i]) {
+				match = false
+				break
+			}
+		}
+		if match {
+			bestWords = overlap
+			break
+		}
+	}
+	if bestWords > 0 {
+		return strings.TrimSpace(strings.Join(currWords[bestWords:], " "))
+	}
+
+	return current
 }
 
 func mergeRollingTranscript(previous, current string) string {
