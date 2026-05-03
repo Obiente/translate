@@ -159,21 +159,6 @@ func (e *EngineCPP) Stream(samples []float32, onSegment func(text string, lang s
 	ctx.SetMaxTokensPerSegment(0)
 	ctx.SetAudioCtx(0)
 
-	// Register segment callback to stream new segments
-	segCB := func(seg whisperpkg.Segment) {
-		text := strings.TrimSpace(seg.Text)
-		if text == "" {
-			return
-		}
-		lang := ctx.Language()
-		if lang == "" {
-			lang = ctx.DetectedLanguage()
-		}
-		if onSegment != nil {
-			onSegment(text, lang)
-		}
-	}
-
 	// Protect against passing extremely long audio into whisper.cpp which
 	// can cause native crashes in some versions of the bindings or when
 	// memory is constrained. Limit to a safe maximum (10 seconds by
@@ -188,9 +173,44 @@ func (e *EngineCPP) Stream(samples []float32, onSegment func(text string, lang s
 
 	log.Info().Int("samples", len(samples)).Msg("whisper: starting stream process")
 
-	if err := ctx.Process(samples, nil, segCB, nil); err != nil {
+	if err := ctx.Process(samples, nil, nil, nil); err != nil {
 		return fmt.Errorf("process audio: %w", err)
 	}
+
+	lang := ""
+	if e.language != "" && e.language != "auto" {
+		lang = e.language
+	} else {
+		lang = ctx.DetectedLanguage()
+		if lang == "" {
+			lang = "auto"
+		}
+	}
+
+	emitted := 0
+	for {
+		seg, nextErr := ctx.NextSegment()
+		if nextErr != nil {
+			if nextErr == io.EOF {
+				break
+			}
+			return fmt.Errorf("read segment: %w", nextErr)
+		}
+		text := strings.TrimSpace(seg.Text)
+		if text == "" {
+			continue
+		}
+		emitted++
+		if onSegment != nil {
+			onSegment(text, lang)
+		}
+	}
+
+	log.Info().
+		Int("samples", len(samples)).
+		Int("segments", emitted).
+		Str("language", lang).
+		Msg("whisper: stream process complete")
 	return nil
 }
 
