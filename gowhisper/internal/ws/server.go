@@ -281,6 +281,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			var lastRepeatedTranscript string
 			var nextRequestID int64
 			var inFlight bool
+			var inFlightReq *inferenceRequest
 			var pendingReq *inferenceRequest
 			const stableThreshold = 2          // Number of passes before marking as final
 			const autoFinalRepeatThreshold = 2 // Repeated identical transcript triggers a final
@@ -321,6 +322,8 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 
 			dispatchRequest := func(req inferenceRequest) {
 				inFlight = true
+				reqCopy := req
+				inFlightReq = &reqCopy
 				select {
 				case reqCh <- req:
 				case <-exitWorker:
@@ -333,6 +336,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 					return
 				case resp := <-respCh:
 					inFlight = false
+					inFlightReq = nil
 					if resp.err != nil {
 						log.Warn().
 							Err(resp.err).
@@ -682,14 +686,6 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 
-				log.Debug().
-					Int("new_samples", newSamplesCount).
-					Int("total_with_context", len(audioWithContext)).
-					Int("total_samples", totalSamples).
-					Float64("context_duration", audioDuration).
-					Float64("new_duration", newDuration).
-					Msg("worker: processing audio with context")
-
 				inferenceSamples := audioWithContext
 				if !finalizeRequested && len(inferenceSamples) > liveInferenceWindowSamples {
 					inferenceSamples = inferenceSamples[len(inferenceSamples)-liveInferenceWindowSamples:]
@@ -705,6 +701,29 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 					windowPeak:        windowPeak,
 					finalizeRequested: finalizeRequested,
 				}
+
+				if inFlightReq != nil &&
+					inFlightReq.totalSamples == req.totalSamples &&
+					inFlightReq.finalizeRequested == req.finalizeRequested {
+					time.Sleep(workTick)
+					continue
+				}
+
+				if pendingReq != nil &&
+					pendingReq.totalSamples == req.totalSamples &&
+					pendingReq.finalizeRequested == req.finalizeRequested {
+					time.Sleep(workTick)
+					continue
+				}
+
+				log.Debug().
+					Int("new_samples", newSamplesCount).
+					Int("total_with_context", len(audioWithContext)).
+					Int("total_samples", totalSamples).
+					Float64("context_duration", audioDuration).
+					Float64("new_duration", newDuration).
+					Bool("finalize", finalizeRequested).
+					Msg("worker: queued audio for inference")
 
 				if !inFlight {
 					dispatchRequest(req)
