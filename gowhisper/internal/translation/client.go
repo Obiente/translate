@@ -46,9 +46,42 @@ type TranslateRequest struct {
 }
 
 type LibreTranslateResponse struct {
-	TranslatedText   string   `json:"translatedText"`
-	Alternatives     []string `json:"alternatives"`
-	DetectedLanguage string   `json:"detectedLanguage"`
+	TranslatedText   string          `json:"translatedText"`
+	Alternatives     []string        `json:"alternatives"`
+	DetectedLanguage json.RawMessage `json:"detectedLanguage"`
+}
+
+func decodeDetectedLanguage(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+
+	var asString string
+	if err := json.Unmarshal(raw, &asString); err == nil {
+		return strings.TrimSpace(asString)
+	}
+
+	var asObject map[string]any
+	if err := json.Unmarshal(raw, &asObject); err == nil {
+		for _, key := range []string{"language", "lang", "code"} {
+			if value, ok := asObject[key].(string); ok {
+				return strings.TrimSpace(value)
+			}
+		}
+	}
+
+	var asArray []map[string]any
+	if err := json.Unmarshal(raw, &asArray); err == nil {
+		for _, item := range asArray {
+			for _, key := range []string{"language", "lang", "code"} {
+				if value, ok := item[key].(string); ok {
+					return strings.TrimSpace(value)
+				}
+			}
+		}
+	}
+
+	return ""
 }
 
 type LanguageEntry struct {
@@ -160,7 +193,7 @@ func (c *Client) TranslateOne(ctx context.Context, text string, source string, t
 	entry := TranslationEntry{
 		Primary:          strings.TrimSpace(lr.TranslatedText),
 		Alternatives:     normalizeAlternatives(lr.Alternatives, lr.TranslatedText),
-		DetectedLanguage: strings.TrimSpace(lr.DetectedLanguage),
+		DetectedLanguage: decodeDetectedLanguage(lr.DetectedLanguage),
 	}
 	c.cache.Store(key, entry)
 	return entry, nil

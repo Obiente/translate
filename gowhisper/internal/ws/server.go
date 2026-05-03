@@ -206,6 +206,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			var lastStableText string
 			var stableTextCount int
 			const stableThreshold = 2 // Number of passes before marking as final
+			const workTick = 250 * time.Millisecond
 
 			for {
 				select {
@@ -218,30 +219,35 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 				samplesMu.Lock()
 				if processedSamples >= len(samples) {
 					samplesMu.Unlock()
-					time.Sleep(50 * time.Millisecond) // Wait for new audio
+					time.Sleep(workTick)
 					continue
 				}
 
-				// Calculate context window: include recent context + new audio
-				// This is critical for sentence continuity!
-				contextSamples := 16000 * 10 // 10 seconds of context
-				startOffset := processedSamples - contextSamples
+				// Process only a bounded recent window so we emit partials regularly
+				// instead of waiting on one long native streaming pass.
+				workWindowSamples := 16000 * 4    // 4 seconds of fresh audio
+				contextWindowSamples := 16000 * 3 // 3 seconds of immediate context
+				startOffset := processedSamples - contextWindowSamples
 				if startOffset < 0 {
 					startOffset = 0
 				}
+				endOffset := processedSamples + workWindowSamples
+				if endOffset > len(samples) {
+					endOffset = len(samples)
+				}
 
-				// Extract CONTEXT + NEW audio for transcription
-				audioWithContext := make([]float32, len(samples)-startOffset)
-				copy(audioWithContext, samples[startOffset:])
-				newSamplesCount := len(samples) - processedSamples
+				// Extract CONTEXT + bounded NEW audio for transcription.
+				audioWithContext := make([]float32, endOffset-startOffset)
+				copy(audioWithContext, samples[startOffset:endOffset])
+				newSamplesCount := endOffset - processedSamples
 				samplesMu.Unlock()
 
 				audioDuration := float64(len(audioWithContext)) / 16000.0
 				newDuration := float64(newSamplesCount) / 16000.0
 
-				// Only process if we have meaningful new audio (>0.3s)
-				if newDuration < 0.3 {
-					time.Sleep(50 * time.Millisecond)
+				// Only process if we have meaningful new audio (>0.4s)
+				if newDuration < 0.4 {
+					time.Sleep(workTick)
 					continue
 				}
 
@@ -253,24 +259,17 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 					Float64("new_duration", newDuration).
 					Msg("worker: processing audio with context")
 
-				// Callback to collect segments (no immediate emission to avoid empty fullText)
-				var segments []string
-				var lastLang string
-				tokenCallback := func(text string, lang string) {
-					segments = append(segments, text)
-					lastLang = lang
-				}
-
-				// Process audio WITH CONTEXT for sentence continuity
-				if err := engine.Stream(audioWithContext, tokenCallback); err != nil {
-					log.Warn().Err(err).Msg("worker: stream failed")
-					time.Sleep(50 * time.Millisecond)
+				// Process a short bounded batch with context.
+				_, fullText, detectedLang, err := engine.Process(audioWithContext)
+				if err != nil {
+					log.Warn().Err(err).Msg("worker: process failed")
+					time.Sleep(workTick)
 					continue
 				}
 
 				// Build result
 				result := transcriptResult{
-					lang:     lastLang,
+					lang:     detectedLang,
 					isFinal:  false,
 					sequence: seq,
 					trans:    map[string]any{},
@@ -279,7 +278,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 					result.lang = "en"
 				}
 
-				fullText := strings.TrimSpace(strings.Join(segments, " "))
+				fullText = strings.TrimSpace(fullText)
 				if fullText != "" {
 					samplesMu.Lock()
 					prevFull := fullTranscript
@@ -407,6 +406,8 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 					Str("full_text", fullText).
 					Bool("is_final", result.isFinal).
 					Msg("worker: chunk complete")
+
+				time.Sleep(workTick)
 			}
 		}()
 	}

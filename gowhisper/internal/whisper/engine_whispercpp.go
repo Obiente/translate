@@ -287,14 +287,14 @@ func (e *EngineCPP) Process(samples []float32) (delta, full, lang string, err er
 	}
 
 	// Build full transcription
-	full = strings.TrimSpace(full)
+	full = strings.TrimSpace(strings.Join(segments, " "))
 
 	// Get detected language
 	if lang == "" {
 		lang = ctx.DetectedLanguage()
 	}
 
-	log.Debug().
+	log.Info().
 		Str("full", full).
 		Str("lang", lang).
 		Int("segments", len(segments)).

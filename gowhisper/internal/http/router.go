@@ -82,11 +82,14 @@ func NewRouter() http.Handler {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
-		writeJSON(w, translation.LibreTranslateResponse{
-			TranslatedText:   entry.Primary,
-			Alternatives:     entry.Alternatives,
-			DetectedLanguage: entry.DetectedLanguage,
-		})
+		payload := map[string]any{
+			"translatedText": entry.Primary,
+			"alternatives":   entry.Alternatives,
+		}
+		if entry.DetectedLanguage != "" {
+			payload["detectedLanguage"] = entry.DetectedLanguage
+		}
+		writeJSON(w, payload)
 	})
 
 	mux.HandleFunc("/detect", func(w http.ResponseWriter, r *http.Request) {
