@@ -551,6 +551,26 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 					}
 
 					if finalizeRequested {
+						if (fullTranscript == "" || isBlankAudioText(fullTranscript)) && len(audioWithContext) >= 8000 {
+							_, retryFullText, retryLang, retryErr := engine.Process(audioWithContext)
+							if retryErr != nil {
+								log.Warn().Err(retryErr).Msg("worker: finalize retry process failed")
+							} else {
+								retryFullText = strings.TrimSpace(retryFullText)
+								if retryFullText != "" && !isBlankAudioText(retryFullText) {
+									fullTranscript = retryFullText
+									result.lang = retryLang
+									if result.lang == "" {
+										result.lang = "en"
+									}
+									log.Info().
+										Str("text", retryFullText).
+										Str("lang", result.lang).
+										Msg("worker: finalize retry recovered non-blank transcript")
+								}
+							}
+						}
+
 						result.isFinal = true
 						result.delta = fullTranscript
 						result.full = fullTranscript
