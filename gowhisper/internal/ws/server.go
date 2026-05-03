@@ -343,6 +343,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 
 				audioDuration := float64(len(audioWithContext)) / 16000.0
 				newDuration := float64(newSamplesCount) / 16000.0
+				windowRMS, windowPeak := audio.SignalStats(audioWithContext)
 
 				// Only process when enough new audio arrived, unless we're
 				// explicitly finalizing because the speaker stopped.
@@ -379,6 +380,24 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 				}
 
 				fullText = strings.TrimSpace(fullText)
+				if isBlankAudioText(fullText) {
+					speechLike := audioDuration >= 0.75 && (windowRMS >= 0.004 || windowPeak >= 0.03)
+					if speechLike {
+						log.Warn().
+							Float64("duration_sec", audioDuration).
+							Float64("rms", windowRMS).
+							Float64("peak", windowPeak).
+							Str("lang", result.lang).
+							Msg("worker: suppressing [BLANK_AUDIO] for speech-like audio window")
+						if finalizeRequested {
+							finalizeRequested = false
+							dumpCurrentAudio("blank_suppressed")
+						}
+						lastSampleCount = totalSamples
+						time.Sleep(workTick)
+						continue
+					}
+				}
 				if fullText != "" {
 					prevFull := fullTranscript
 					prevFinalized := finalizedText
@@ -921,6 +940,11 @@ func safeFileComponent(input string) string {
 		".", "_",
 	)
 	return replacer.Replace(input)
+}
+
+func isBlankAudioText(text string) bool {
+	normalized := strings.ToUpper(strings.TrimSpace(text))
+	return normalized == "[BLANK_AUDIO]" || normalized == "BLANK_AUDIO"
 }
 
 func writeJSON(c *websocket.Conn, meta *clientMeta, payload any) {
