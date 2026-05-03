@@ -2,8 +2,10 @@ package audio
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 
 	"github.com/go-audio/wav"
 )
@@ -61,12 +63,27 @@ func DecodePCM16LEToFloat32(b []byte, sampleRate int) ([]float32, int, error) {
 	}
 	out := make([]float32, len(b)/2)
 	for i := 0; i < len(out); i++ {
-		lo := int(int8(b[2*i]))
-		hi := int(int8(b[2*i+1]))
-		v := int16(uint16(uint8(lo)) | uint16(uint8(hi))<<8)
+		v := int16(binary.LittleEndian.Uint16(b[i*2 : i*2+2]))
 		out[i] = float32(v) / 32768.0
 	}
 	return out, sampleRate, nil
+}
+
+// SignalStats returns RMS and peak amplitude for normalized PCM32F samples.
+func SignalStats(samples []float32) (rms float64, peak float64) {
+	if len(samples) == 0 {
+		return 0, 0
+	}
+	var sumSquares float64
+	for _, sample := range samples {
+		value := math.Abs(float64(sample))
+		sumSquares += value * value
+		if value > peak {
+			peak = value
+		}
+	}
+	rms = math.Sqrt(sumSquares / float64(len(samples)))
+	return rms, peak
 }
 
 // ResampleLinear resamples PCM32F from inRate to outRate using linear interpolation.

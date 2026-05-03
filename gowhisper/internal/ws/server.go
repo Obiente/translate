@@ -682,6 +682,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			// Append to session buffer
 			if len(pcm) > 0 {
 				chunksReceived++
+				rms, peak := audio.SignalStats(pcm)
 				samplesMu.Lock()
 				samples = append(samples, pcm...)
 
@@ -707,6 +708,8 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 						Int("chunk_samples", len(pcm)).
 						Int("total_samples", len(samples)).
 						Float64("duration_sec", float64(len(samples))/16000.0).
+						Float64("rms", rms).
+						Float64("peak", peak).
 						Str("room_id", roomID).
 						Str("peer_id", meta.peerID).
 						Str("channel_id", meta.channelID).
