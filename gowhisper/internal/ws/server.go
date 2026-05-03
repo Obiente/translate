@@ -264,11 +264,12 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			const stableThreshold = 2          // Number of passes before marking as final
 			const autoFinalRepeatThreshold = 2 // Repeated identical transcript triggers a final
 			const workTick = 100 * time.Millisecond
-			const minStepSamples = 1600              // 100ms at 16kHz for steady partial updates
-			const minLiveInferenceSamples = 6400     // 400ms before first live hypothesis
-			const minFinalizeInferenceSamples = 9600 // 600ms before trusting finalize retry
-			const maxWindowSamples = 16000 * 8       // 8 seconds rolling utterance window
-			const keepRecentSamples = 16000 * 3      // 3 seconds context after a final
+			const minStepSamples = 1600                  // 100ms at 16kHz for steady partial updates
+			const minLiveInferenceSamples = 6400         // 400ms before first live hypothesis
+			const minFinalizeInferenceSamples = 9600     // 600ms before trusting finalize retry
+			const liveInferenceWindowSamples = 16000 * 2 // 2 seconds for low-latency partials
+			const maxWindowSamples = 16000 * 8           // 8 seconds rolling utterance window
+			const keepRecentSamples = 16000 * 3          // 3 seconds context after a final
 
 			for {
 				select {
@@ -372,8 +373,15 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 					Float64("new_duration", newDuration).
 					Msg("worker: processing audio with context")
 
-				// Process a short bounded batch with context.
-				_, fullText, detectedLang, err := engine.Process(audioWithContext)
+				// Use a small recent window for live partials so we keep the UI moving.
+				// Finals still retry against the fuller utterance buffer.
+				inferenceSamples := audioWithContext
+				if !finalizeRequested && len(inferenceSamples) > liveInferenceWindowSamples {
+					inferenceSamples = inferenceSamples[len(inferenceSamples)-liveInferenceWindowSamples:]
+				}
+
+				// Process a bounded batch with context.
+				_, fullText, detectedLang, err := engine.Process(inferenceSamples)
 				if err != nil {
 					log.Warn().Err(err).Msg("worker: process failed")
 					time.Sleep(workTick)
@@ -392,11 +400,12 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 				}
 
 				fullText = strings.TrimSpace(fullText)
-				speechLike := isSpeechLikeWindow(audioDuration, windowRMS, windowPeak)
+				inferenceDuration := float64(len(inferenceSamples)) / 16000.0
+				speechLike := isSpeechLikeWindow(inferenceDuration, windowRMS, windowPeak)
 				if isBlankAudioText(fullText) {
 					if speechLike {
 						log.Warn().
-							Float64("duration_sec", audioDuration).
+							Float64("duration_sec", inferenceDuration).
 							Float64("rms", windowRMS).
 							Float64("peak", windowPeak).
 							Str("lang", result.lang).

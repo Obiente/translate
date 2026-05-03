@@ -44,6 +44,7 @@ const _statusMessage = ref('');
 const _socket = ref<WebSocket | null>(null);
 const _transcripts = reactive<RoomTranscript[]>([]);
 const _members = reactive<Array<{ peerId: string | null; peerLabel: string | null; peerAvatarUrl: string | null; channelId: string | null }>>([]);
+const _lastFinalBySpeaker = reactive(new Map<string, string>());
 let _keepaliveTimer: number | null = null;
 let _reconnectTimer: number | null = null;
 let _lastKeepaliveAt = 0;
@@ -175,6 +176,17 @@ export const useRoomManager = () => {
             sequence: typeof payload.sequence === 'number' ? payload.sequence : undefined,
             timestamp: new Date().toISOString(),
           };
+          if (entry.isFinal) {
+            const speakerKey = entry.channelId || entry.peerId || 'speaker';
+            const canonical = (entry.fullText || entry.text || '').trim().toLowerCase();
+            const previous = _lastFinalBySpeaker.get(speakerKey);
+            if (canonical && previous === canonical) {
+              return;
+            }
+            if (canonical) {
+              _lastFinalBySpeaker.set(speakerKey, canonical);
+            }
+          }
           transcripts.push(entry);
           return;
         }
