@@ -5,6 +5,7 @@ export interface RoomTranscript {
   roomId: string;
   peerId: string | null;
   peerLabel: string | null;
+  peerAvatarUrl?: string | null;
   channelId?: string | null;
   text: string;
   fullText?: string;
@@ -42,7 +43,7 @@ const _status = ref<RoomStatus>('idle');
 const _statusMessage = ref('');
 const _socket = ref<WebSocket | null>(null);
 const _transcripts = reactive<RoomTranscript[]>([]);
-const _members = reactive<Array<{ peerId: string | null; peerLabel: string | null; channelId: string | null }>>([]);
+const _members = reactive<Array<{ peerId: string | null; peerLabel: string | null; peerAvatarUrl: string | null; channelId: string | null }>>([]);
 let _keepaliveTimer: number | null = null;
 let _reconnectTimer: number | null = null;
 let _lastKeepaliveAt = 0;
@@ -164,6 +165,7 @@ export const useRoomManager = () => {
             roomId: payload.room_id || payload.roomId,
             peerId: payload.peer_id || payload.peerId || null,
             peerLabel: payload.peer_label || payload.peerLabel || null,
+            peerAvatarUrl: payload.peer_avatar_url || payload.peerAvatarUrl || null,
             channelId: payload.channel_id || payload.channelId || null,
             text: typeof payload.text === 'string' ? payload.text : '',
             fullText: typeof payload.fullText === 'string' ? payload.fullText : undefined,
@@ -182,6 +184,7 @@ export const useRoomManager = () => {
           _members.splice(0, _members.length, ...list.map((m: any) => ({
             peerId: typeof m?.peer_id === 'string' ? m.peer_id : (typeof m?.peerId === 'string' ? m.peerId : null),
             peerLabel: typeof m?.peer_label === 'string' ? m.peer_label : (typeof m?.peerLabel === 'string' ? m.peerLabel : null),
+            peerAvatarUrl: typeof m?.peer_avatar_url === 'string' ? m.peer_avatar_url : (typeof m?.peerAvatarUrl === 'string' ? m.peerAvatarUrl : null),
             channelId: typeof m?.channel_id === 'string' ? m.channel_id : (typeof m?.channelId === 'string' ? m.channelId : null),
           })));
           return;

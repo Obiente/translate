@@ -14,7 +14,10 @@
     <section class="discord-room__hero">
       <div class="discord-room__hero-copy">
         <span class="eyebrow">Discord live captions</span>
-        <h1>{{ latestLine || "Waiting for speech" }}</h1>
+        <h1>{{ heroTitle }}</h1>
+        <p class="discord-room__hero-summary">
+          {{ heroSummary }}
+        </p>
         <div class="discord-room__meta">
           <p>
             <span class="meta-label">Room</span>
@@ -41,10 +44,16 @@
         :class="{ active: speaker.isActive }"
       >
         <header>
-          <span class="speaker-avatar">{{ speaker.initials }}</span>
+          <img
+            v-if="speaker.avatarUrl"
+            class="speaker-avatar speaker-avatar--image"
+            :src="speaker.avatarUrl"
+            :alt="speaker.label"
+          />
+          <span v-else class="speaker-avatar">{{ speaker.initials }}</span>
           <div>
             <strong>{{ speaker.label }}</strong>
-            <small>{{ speaker.language || "auto" }}</small>
+            <small>{{ speaker.meta }}</small>
           </div>
         </header>
         <p class="speaker-translation">
@@ -177,6 +186,17 @@ const latestLine = computed(() => {
   return bestTranslation(latest) || latest.fullText || latest.text || "";
 });
 
+const heroTitle = computed(() => {
+  if (!speakerCards.value.length) return "Live room ready";
+  const activeSpeaker = speakerCards.value[0];
+  return activeSpeaker.label;
+});
+
+const heroSummary = computed(() => {
+  if (!speakerCards.value.length) return emptyStateMessage.value;
+  return latestLine.value || "Captions will appear here as soon as speech is detected.";
+});
+
 const speakerCards = computed(() => {
   const bySpeaker = new Map<string, RoomTranscript>();
   for (const entry of captions.value) {
@@ -191,7 +211,9 @@ const speakerCards = computed(() => {
         id: speakerKey(entry),
         label,
         initials: initialsFor(label),
+        avatarUrl: entry.peerAvatarUrl || memberAvatarFor(entry),
         language: entry.language,
+        meta: [entry.language || "auto", entry.isFinal ? "final" : "live"].join(" - "),
         transcript: entry.fullText || entry.text || "",
         translation: bestTranslation(entry),
         isActive: Number.isFinite(timestamp) && Date.now() - timestamp < ACTIVE_WINDOW_MS,
@@ -239,10 +261,26 @@ function speakerKey(entry: RoomTranscript): string {
 }
 
 function speakerLabel(entry: RoomTranscript): string {
-  const raw = entry.peerLabel || entry.peerId || entry.channelId || "Speaker";
+  const raw = (entry.peerLabel || memberLabelFor(entry) || entry.peerId || entry.channelId || "Speaker").trim();
   const mention = raw.match(/^<@!?(\d+)>$/);
   if (mention) return `Discord ${mention[1].slice(-4)}`;
   return raw;
+}
+
+function memberLabelFor(entry: RoomTranscript): string {
+  const member = room.members.find((item) =>
+    (item.channelId && entry.channelId && item.channelId === entry.channelId) ||
+    (item.peerId && entry.peerId && item.peerId === entry.peerId)
+  );
+  return member?.peerLabel || "";
+}
+
+function memberAvatarFor(entry: RoomTranscript): string {
+  const member = room.members.find((item) =>
+    (item.channelId && entry.channelId && item.channelId === entry.channelId) ||
+    (item.peerId && entry.peerId && item.peerId === entry.peerId)
+  );
+  return member?.peerAvatarUrl || "";
 }
 
 function initialsFor(label: string): string {

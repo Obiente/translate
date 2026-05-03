@@ -44,10 +44,11 @@ type Server struct {
 }
 
 type clientMeta struct {
-	peerID    string
-	peerLabel string
-	channelID string
-	writeMu   *sync.Mutex
+	peerID        string
+	peerLabel     string
+	peerAvatarURL string
+	channelID     string
+	writeMu       *sync.Mutex
 }
 
 func NewServer(cfg config.Config) *Server {
@@ -155,17 +156,18 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 
 		if roomID != "" {
 			rp := map[string]any{
-				"type":         "room_transcript",
-				"room_id":      roomID,
-				"peer_id":      meta.peerID,
-				"peer_label":   meta.peerLabel,
-				"channel_id":   meta.channelID,
-				"text":         r.delta,
-				"fullText":     r.full,
-				"language":     r.lang,
-				"isFinal":      r.isFinal,
-				"sequence":     r.sequence,
-				"translations": r.trans,
+				"type":            "room_transcript",
+				"room_id":         roomID,
+				"peer_id":         meta.peerID,
+				"peer_label":      meta.peerLabel,
+				"peer_avatar_url": meta.peerAvatarURL,
+				"channel_id":      meta.channelID,
+				"text":            r.delta,
+				"fullText":        r.full,
+				"language":        r.lang,
+				"isFinal":         r.isFinal,
+				"sequence":        r.sequence,
+				"translations":    r.trans,
 			}
 			s.broadcast(roomID, conn, meta.peerID, rp)
 		}
@@ -494,15 +496,25 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			if v, ok := msg["peer_label"].(string); ok {
 				meta.peerLabel = v
 			}
+			if v, ok := msg["peer_avatar_url"].(string); ok {
+				meta.peerAvatarURL = v
+			}
 			s.joinRoom(rid, conn, meta)
 			roomID = rid
 			log.Info().
 				Str("room_id", roomID).
 				Str("peer_id", meta.peerID).
 				Str("peer_label", meta.peerLabel).
+				Str("peer_avatar_url", meta.peerAvatarURL).
 				Str("channel_id", meta.channelID).
 				Msg("ws room joined")
-			_ = sendJSON(map[string]any{"type": "room_joined", "room_id": roomID, "peer_id": meta.peerID, "peer_label": meta.peerLabel})
+			_ = sendJSON(map[string]any{
+				"type":            "room_joined",
+				"room_id":         roomID,
+				"peer_id":         meta.peerID,
+				"peer_label":      meta.peerLabel,
+				"peer_avatar_url": meta.peerAvatarURL,
+			})
 		case "leave_room":
 			s.leaveRoom(roomID, conn)
 			roomID = ""
@@ -634,7 +646,13 @@ func (s *Server) joinRoom(room string, c *websocket.Conn, meta *clientMeta) {
 	if writeMu == nil {
 		writeMu = &sync.Mutex{}
 	}
-	m[c] = &clientMeta{peerID: meta.peerID, peerLabel: meta.peerLabel, channelID: meta.channelID, writeMu: writeMu}
+	m[c] = &clientMeta{
+		peerID:        meta.peerID,
+		peerLabel:     meta.peerLabel,
+		peerAvatarURL: meta.peerAvatarURL,
+		channelID:     meta.channelID,
+		writeMu:       writeMu,
+	}
 	s.mu.Unlock()
 	s.broadcastRoster(room)
 }
@@ -693,9 +711,10 @@ func (s *Server) broadcastRoster(room string) {
 			continue
 		}
 		members = append(members, map[string]any{
-			"peer_id":    info.peerID,
-			"peer_label": info.peerLabel,
-			"channel_id": info.channelID,
+			"peer_id":         info.peerID,
+			"peer_label":      info.peerLabel,
+			"peer_avatar_url": info.peerAvatarURL,
+			"channel_id":      info.channelID,
 		})
 	}
 	for c, info := range m {

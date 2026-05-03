@@ -74,12 +74,20 @@
 }
 
 .discord-room__hero h1 {
-  max-width: 11ch;
+  max-width: 14ch;
   margin: 0;
-  font-size: clamp(2.8rem, 6vw, 5.8rem);
-  line-height: 0.9;
+  font-size: clamp(2.2rem, 4vw, 4.2rem);
+  line-height: 0.98;
   letter-spacing: 0;
-  text-wrap: balance;
+  text-wrap: pretty;
+}
+
+.discord-room__hero-summary {
+  max-width: 48rem;
+  margin: 0;
+  color: var(--muted);
+  font-size: clamp(1rem, 1.6vw, 1.2rem);
+  line-height: 1.5;
 }
 
 .discord-room__meta {
@@ -157,7 +165,7 @@
 }
 
 .speaker-lane {
-  min-height: 220px;
+  min-height: 180px;
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 1rem;
@@ -199,10 +207,15 @@
   font-weight: 900;
 }
 
+.speaker-avatar--image {
+  object-fit: cover;
+  background: rgba(246, 238, 214, 0.08);
+}
+
 .speaker-translation {
   margin: auto 0 0;
-  font-size: clamp(1.55rem, 4vw, 3rem);
-  line-height: 1.08;
+  font-size: clamp(1.2rem, 2.8vw, 2.25rem);
+  line-height: 1.14;
   font-weight: 800;
 }
 
@@ -320,7 +333,7 @@
   }
 
   .discord-room__hero h1 {
-    max-width: 8ch;
+    max-width: none;
   }
 
   .discord-room__meta {
