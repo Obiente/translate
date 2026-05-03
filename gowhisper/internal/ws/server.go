@@ -263,8 +263,8 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			const autoFinalRepeatThreshold = 2 // Repeated identical transcript triggers a final
 			const workTick = 75 * time.Millisecond
 			const minStepSamples = 800          // 50ms at 16kHz
-			const maxWindowSamples = 16000 * 3  // 3 seconds rolling utterance window
-			const keepRecentSamples = 16000 * 1 // 1 second context after a final
+			const maxWindowSamples = 16000 * 6  // 6 seconds rolling utterance window
+			const keepRecentSamples = 16000 * 2 // 2 seconds context after a final
 
 			for {
 				select {
@@ -422,6 +422,8 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 						fullTranscript = strings.TrimSpace(confirmedPrefix + " " + fullText)
 					} else if confirmedPrefix != "" {
 						fullTranscript = strings.TrimSpace(confirmedPrefix)
+					} else if prevFull != "" {
+						fullTranscript = mergeRollingTranscript(prevFull, fullText)
 					} else {
 						fullTranscript = fullText
 					}
@@ -945,6 +947,65 @@ func safeFileComponent(input string) string {
 func isBlankAudioText(text string) bool {
 	normalized := strings.ToUpper(strings.TrimSpace(text))
 	return normalized == "[BLANK_AUDIO]" || normalized == "BLANK_AUDIO"
+}
+
+func mergeRollingTranscript(previous, current string) string {
+	previous = strings.TrimSpace(previous)
+	current = strings.TrimSpace(current)
+	if previous == "" {
+		return current
+	}
+	if current == "" {
+		return previous
+	}
+	if previous == current {
+		return current
+	}
+	if strings.HasSuffix(previous, current) {
+		return previous
+	}
+	if strings.HasPrefix(current, previous) {
+		return current
+	}
+
+	maxOverlap := min(len(previous), len(current))
+	best := 0
+	for overlap := maxOverlap; overlap >= 1; overlap-- {
+		if strings.EqualFold(previous[len(previous)-overlap:], current[:overlap]) {
+			best = overlap
+			break
+		}
+	}
+	if best > 0 {
+		return strings.TrimSpace(previous + current[best:])
+	}
+
+	prevWords := strings.Fields(previous)
+	currWords := strings.Fields(current)
+	bestWords := 0
+	maxWordOverlap := min(len(prevWords), len(currWords))
+	for overlap := maxWordOverlap; overlap >= 1; overlap-- {
+		match := true
+		for i := 0; i < overlap; i++ {
+			if !strings.EqualFold(prevWords[len(prevWords)-overlap+i], currWords[i]) {
+				match = false
+				break
+			}
+		}
+		if match {
+			bestWords = overlap
+			break
+		}
+	}
+	if bestWords > 0 {
+		merged := append(append([]string{}, prevWords...), currWords[bestWords:]...)
+		return strings.TrimSpace(strings.Join(merged, " "))
+	}
+
+	if len(current) > len(previous) {
+		return current
+	}
+	return previous
 }
 
 func writeJSON(c *websocket.Conn, meta *clientMeta, payload any) {
