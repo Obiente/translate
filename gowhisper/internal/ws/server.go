@@ -214,10 +214,10 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			var lastRepeatedTranscript string
 			const stableThreshold = 2          // Number of passes before marking as final
 			const autoFinalRepeatThreshold = 2 // Repeated identical transcript triggers a final
-			const workTick = 100 * time.Millisecond
-			const minStepSamples = 1600         // 100ms at 16kHz
-			const maxWindowSamples = 16000 * 8  // 8 seconds rolling utterance window
-			const keepRecentSamples = 16000 * 2 // 2 seconds context after a final
+			const workTick = 75 * time.Millisecond
+			const minStepSamples = 800          // 50ms at 16kHz
+			const maxWindowSamples = 16000 * 3  // 3 seconds rolling utterance window
+			const keepRecentSamples = 16000 * 1 // 1 second context after a final
 
 			for {
 				select {
@@ -246,7 +246,8 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 								result.lang = "en"
 							}
 
-							if s.cfg.TranslationEnabled && len(targetLanguages) > 0 {
+							shouldTranslateFinal := s.cfg.TranslationEnabled && len(targetLanguages) > 0
+							if shouldTranslateFinal {
 								ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.cfg.TranslationTimeoutSec)*time.Second)
 								alts := translationAlternatives
 								if alts < 0 {
@@ -455,8 +456,13 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 						log.Info().Str("text", fullTranscript).Msg("worker: auto-final triggered by repeated transcript")
 					}
 
-					// Translations
-					if s.cfg.TranslationEnabled && len(targetLanguages) > 0 && result.delta != "" {
+					// Partial translations are optional. To keep the room feeling live,
+					// default to translating only finals unless explicitly enabled.
+					shouldTranslate := s.cfg.TranslationEnabled &&
+						len(targetLanguages) > 0 &&
+						result.delta != "" &&
+						(result.isFinal || s.cfg.TranslatePartials)
+					if shouldTranslate {
 						ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.cfg.TranslationTimeoutSec)*time.Second)
 						alts := translationAlternatives
 						if alts < 0 {

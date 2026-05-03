@@ -10,6 +10,7 @@ type Config struct {
 	ModelPath             string
 	TranslationBaseURL    string
 	TranslationEnabled    bool
+	TranslatePartials     bool
 	TranslationTimeoutSec int
 }
 
@@ -47,6 +48,7 @@ func Load() Config {
 		ModelPath:             getenv("WHISPER_MODEL_PATH", "./models/ggml-base.bin"),
 		TranslationBaseURL:    getenv("TRANSLATION_BASE_URL", "https://libretranslate.obiente.cloud"),
 		TranslationEnabled:    getenvBool("WHISPER_SERVER_TRANSLATIONS", true),
+		TranslatePartials:     getenvBool("WHISPER_SERVER_TRANSLATE_PARTIALS", false),
 		TranslationTimeoutSec: getenvInt("TRANSLATION_TIMEOUT", 8),
 	}
 }

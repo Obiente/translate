@@ -35,7 +35,7 @@ func NewEngine(modelPath string) (Engine, error) {
 	}
 	// Cap threads to a sane maximum by default to avoid native crashes on
 	// some platforms when too many threads are used by whisper.cpp.
-	const maxDefaultThreads = 8
+	const maxDefaultThreads = 4
 	if defaultThreads > maxDefaultThreads {
 		defaultThreads = maxDefaultThreads
 	}
