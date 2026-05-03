@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -102,6 +105,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 		exitWorker        = make(chan struct{}) // signal worker to exit
 		stopWorkerOnce    sync.Once
 		finalizeRequested bool
+		dumpCount         int
 	)
 	meta.writeMu = &writeMu
 
@@ -115,6 +119,49 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 		writeMu.Lock()
 		defer writeMu.Unlock()
 		return conn.WriteJSON(payload)
+	}
+
+	dumpCurrentAudio := func(tag string) {
+		if s.cfg.DebugDumpDir == "" {
+			return
+		}
+		samplesMu.Lock()
+		snapshot := append([]float32(nil), samples...)
+		samplesMu.Unlock()
+		if len(snapshot) == 0 {
+			return
+		}
+		if err := os.MkdirAll(s.cfg.DebugDumpDir, 0o755); err != nil {
+			log.Warn().Err(err).Str("dir", s.cfg.DebugDumpDir).Msg("failed to create debug dump dir")
+			return
+		}
+		wavBytes, err := audio.EncodePCM16MonoWAV(snapshot, 16000)
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to encode debug wav")
+			return
+		}
+		dumpCount++
+		name := fmt.Sprintf(
+			"%s_%s_%s_%02d_%d.wav",
+			safeFileComponent(roomID),
+			safeFileComponent(meta.peerID),
+			safeFileComponent(tag),
+			dumpCount,
+			time.Now().UnixMilli(),
+		)
+		path := filepath.Join(s.cfg.DebugDumpDir, name)
+		if err := os.WriteFile(path, wavBytes, 0o644); err != nil {
+			log.Warn().Err(err).Str("path", path).Msg("failed to write debug wav")
+			return
+		}
+		rms, peak := audio.SignalStats(snapshot)
+		log.Info().
+			Str("path", path).
+			Int("samples", len(snapshot)).
+			Float64("seconds", float64(len(snapshot))/16000.0).
+			Float64("rms", rms).
+			Float64("peak", peak).
+			Msg("wrote debug audio dump")
 	}
 
 	// channel to receive transcription results from async workers
@@ -263,10 +310,11 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 								cancel()
 							}
 
-							finalizedText = trimmed
-							finalizeRequested = false
-							log.Info().Str("text", trimmed).Msg("worker: forcing final transcript after speaker inactivity")
-							select {
+						finalizedText = trimmed
+						finalizeRequested = false
+						dumpCurrentAudio("finalize_idle")
+						log.Info().Str("text", trimmed).Msg("worker: forcing final transcript after speaker inactivity")
+						select {
 							case resCh <- result:
 							case <-time.After(1 * time.Second):
 							}
@@ -487,6 +535,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 						result.full = fullTranscript
 						finalizedText = fullTranscript
 						finalizeRequested = false
+						dumpCurrentAudio("finalize_request")
 						log.Info().Str("text", fullTranscript).Msg("worker: promoting transcript to final after finalize request")
 					}
 
@@ -857,6 +906,21 @@ func (s *Server) broadcastRoster(room string) {
 	for _, recipient := range recipients {
 		writeJSON(recipient.conn, recipient.meta, payload)
 	}
+}
+
+func safeFileComponent(input string) string {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "unknown"
+	}
+	replacer := strings.NewReplacer(
+		"/", "_",
+		"\\", "_",
+		":", "_",
+		" ", "_",
+		".", "_",
+	)
+	return replacer.Replace(input)
 }
 
 func writeJSON(c *websocket.Conn, meta *clientMeta, payload any) {

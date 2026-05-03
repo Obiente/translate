@@ -12,6 +12,7 @@ type Config struct {
 	TranslationEnabled    bool
 	TranslatePartials     bool
 	TranslationTimeoutSec int
+	DebugDumpDir          string
 }
 
 func getenv(key, def string) string {
@@ -50,5 +51,6 @@ func Load() Config {
 		TranslationEnabled:    getenvBool("WHISPER_SERVER_TRANSLATIONS", true),
 		TranslatePartials:     getenvBool("WHISPER_SERVER_TRANSLATE_PARTIALS", false),
 		TranslationTimeoutSec: getenvInt("TRANSLATION_TIMEOUT", 8),
+		DebugDumpDir:          getenv("WHISPER_SERVER_DEBUG_DUMP_DIR", ""),
 	}
 }

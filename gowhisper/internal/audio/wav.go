@@ -114,3 +114,66 @@ func ResampleLinear(samples []float32, inRate, outRate int) []float32 {
 	}
 	return out
 }
+
+// EncodePCM16MonoWAV encodes normalized mono PCM samples to a 16-bit PCM WAV file.
+func EncodePCM16MonoWAV(samples []float32, sampleRate int) ([]byte, error) {
+	if sampleRate <= 0 {
+		sampleRate = 16000
+	}
+	dataSize := len(samples) * 2
+	buf := bytes.NewBuffer(make([]byte, 0, 44+dataSize))
+
+	write := func(v any) error {
+		return binary.Write(buf, binary.LittleEndian, v)
+	}
+
+	if _, err := buf.WriteString("RIFF"); err != nil {
+		return nil, err
+	}
+	if err := write(uint32(36 + dataSize)); err != nil {
+		return nil, err
+	}
+	if _, err := buf.WriteString("WAVE"); err != nil {
+		return nil, err
+	}
+	if _, err := buf.WriteString("fmt "); err != nil {
+		return nil, err
+	}
+	if err := write(uint32(16)); err != nil {
+		return nil, err
+	}
+	if err := write(uint16(1)); err != nil {
+		return nil, err
+	}
+	if err := write(uint16(1)); err != nil {
+		return nil, err
+	}
+	if err := write(uint32(sampleRate)); err != nil {
+		return nil, err
+	}
+	byteRate := sampleRate * 2
+	if err := write(uint32(byteRate)); err != nil {
+		return nil, err
+	}
+	if err := write(uint16(2)); err != nil {
+		return nil, err
+	}
+	if err := write(uint16(16)); err != nil {
+		return nil, err
+	}
+	if _, err := buf.WriteString("data"); err != nil {
+		return nil, err
+	}
+	if err := write(uint32(dataSize)); err != nil {
+		return nil, err
+	}
+
+	for _, sample := range samples {
+		value := math.Round(math.Max(-1, math.Min(1, float64(sample))) * 32767.0)
+		if err := write(int16(value)); err != nil {
+			return nil, err
+		}
+	}
+
+	return buf.Bytes(), nil
+}
