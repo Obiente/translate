@@ -160,13 +160,9 @@ func NewRouter() http.Handler {
 			http.Error(w, fmt.Sprintf("engine init failed: %v", err), http.StatusInternalServerError)
 			return
 		}
-		if lang := strings.TrimSpace(r.FormValue("language")); lang != "" {
-			eng.SetLanguage(lang)
-		} else {
-			eng.SetLanguage("auto")
-		}
+		lang := strings.TrimSpace(r.FormValue("language"))
 
-		text, full, language, err := eng.Process(pcm)
+		text, full, language, err := eng.ProcessWithLanguage(pcm, lang)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -195,7 +191,7 @@ func NewRouter() http.Handler {
 	})
 
 	// Streaming transcription WebSocket
-	wss := ws.NewServer(cfg)
+	wss := ws.NewServerWithEngine(cfg, ensureEngine)
 	mux.HandleFunc("/ws/transcribe", wss.Handle)
 	return mux
 }

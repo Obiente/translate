@@ -33,25 +33,20 @@ func NewEngine(modelPath string) (Engine, error) {
 	if defaultThreads < 1 {
 		defaultThreads = 1
 	}
-	// Cap threads to a sane maximum by default to avoid native crashes on
-	// some platforms when too many threads are used by whisper.cpp.
-	const maxDefaultThreads = 4
-	if defaultThreads > maxDefaultThreads {
-		defaultThreads = maxDefaultThreads
-	}
 	threads := uint(defaultThreads)
 	if v := os.Getenv("WHISPER_THREADS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			// Clamp user-specified value to avoid unsafe extremes
-			if n > maxDefaultThreads {
-				log.Warn().Int("requested_threads", n).Int("clamped_to", maxDefaultThreads).Msg("whisper: requested thread count is high, clamping to safe default")
-				n = maxDefaultThreads
-			}
 			threads = uint(n)
 			log.Info().Int("threads", n).Msg("whisper: using configured thread count")
 		}
 	} else {
-		log.Info().Uint("threads", threads).Msg("whisper: using default thread count (clamped)")
+		log.Info().Uint("threads", threads).Msg("whisper: using default thread count")
+	}
+	if v := os.Getenv("WHISPER_MAX_THREADS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && threads > uint(n) {
+			log.Warn().Uint("requested_threads", threads).Int("clamped_to", n).Msg("whisper: clamping thread count to WHISPER_MAX_THREADS")
+			threads = uint(n)
+		}
 	}
 
 	// Streaming config: work window and context size
@@ -104,11 +99,8 @@ func (e *EngineCPP) Close() error {
 func (e *EngineCPP) SetLanguage(lang string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if lang == "" {
-		lang = "auto"
-	}
-	e.language = lang
-	log.Info().Str("language", lang).Msg("whisper: language configured")
+	e.language = normalizeLanguage(lang)
+	log.Info().Str("language", e.language).Msg("whisper: language configured")
 }
 
 // GetStreamingConfig returns the work window and context size in samples.
@@ -119,6 +111,13 @@ func (e *EngineCPP) GetStreamingConfig() (int, int) {
 // Stream processes audio and invokes the callback for each new segment as soon as it's available.
 // It configures the context for greedy decoding and single-segment mode to stream partials faster.
 func (e *EngineCPP) Stream(samples []float32, onSegment func(text string, lang string)) (err error) {
+	e.mu.Lock()
+	language := e.language
+	e.mu.Unlock()
+	return e.streamWithLanguage(samples, language, onSegment)
+}
+
+func (e *EngineCPP) streamWithLanguage(samples []float32, language string, onSegment func(text string, lang string)) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Error().Interface("panic", r).Stack().Msg("whisper: panic in stream, recovering")
@@ -128,6 +127,7 @@ func (e *EngineCPP) Stream(samples []float32, onSegment func(text string, lang s
 	if len(samples) == 0 {
 		return nil
 	}
+	language = normalizeLanguage(language)
 
 	// Serialize access to the model to prevent concurrent processing crashes
 	e.mu.Lock()
@@ -152,7 +152,7 @@ func (e *EngineCPP) Stream(samples []float32, onSegment func(text string, lang s
 		return fmt.Errorf("create context: %w", err)
 	}
 	ctx.SetThreads(e.threads)
-	_ = ctx.SetLanguage(e.language) // Use configured language
+	_ = ctx.SetLanguage(language)
 	ctx.SetSplitOnWord(true)
 	ctx.SetTokenTimestamps(true)
 	ctx.SetMaxSegmentLength(0)
@@ -178,8 +178,8 @@ func (e *EngineCPP) Stream(samples []float32, onSegment func(text string, lang s
 	}
 
 	lang := ""
-	if e.language != "" && e.language != "auto" {
-		lang = e.language
+	if language != "" && language != "auto" {
+		lang = language
 	} else {
 		lang = ctx.DetectedLanguage()
 		if lang == "" {
@@ -217,6 +217,13 @@ func (e *EngineCPP) Stream(samples []float32, onSegment func(text string, lang s
 // Process implements Engine by running a full-context transcription.
 // This method is thread-safe but processes serially to avoid whisper.cpp crashes.
 func (e *EngineCPP) Process(samples []float32) (delta, full, lang string, err error) {
+	e.mu.Lock()
+	language := e.language
+	e.mu.Unlock()
+	return e.ProcessWithLanguage(samples, language)
+}
+
+func (e *EngineCPP) ProcessWithLanguage(samples []float32, language string) (delta, full, lang string, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Error().Interface("panic", r).Stack().Msg("whisper: panic in process, recovering")
@@ -226,6 +233,7 @@ func (e *EngineCPP) Process(samples []float32) (delta, full, lang string, err er
 	if len(samples) == 0 {
 		return "", "", "", nil
 	}
+	language = normalizeLanguage(language)
 
 	// Serialize access to the model to prevent concurrent processing crashes
 	e.mu.Lock()
@@ -254,7 +262,7 @@ func (e *EngineCPP) Process(samples []float32) (delta, full, lang string, err er
 
 	// Configure context for optimal streaming performance
 	ctx.SetThreads(e.threads)
-	ctx.SetLanguage(e.language)   // Use configured language
+	ctx.SetLanguage(language)     // Use configured language
 	ctx.SetSplitOnWord(true)      // Split on word boundaries for better streaming
 	ctx.SetTokenTimestamps(true)  // Enable timestamps for better segmentation
 	ctx.SetMaxSegmentLength(0)    // No artificial limit on segment length
@@ -290,7 +298,9 @@ func (e *EngineCPP) Process(samples []float32) (delta, full, lang string, err er
 	full = strings.TrimSpace(strings.Join(segments, " "))
 
 	// Get detected language
-	if lang == "" {
+	if language != "" && language != "auto" {
+		lang = language
+	} else if lang == "" {
 		lang = ctx.DetectedLanguage()
 	}
 
@@ -304,4 +314,12 @@ func (e *EngineCPP) Process(samples []float32) (delta, full, lang string, err er
 	// For streaming, we don't compute delta here - let the caller handle it
 	// based on their previous state
 	return "", full, lang, nil
+}
+
+func normalizeLanguage(lang string) string {
+	lang = strings.TrimSpace(strings.ToLower(lang))
+	if lang == "" {
+		return "auto"
+	}
+	return lang
 }

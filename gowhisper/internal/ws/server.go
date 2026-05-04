@@ -39,11 +39,14 @@ func max(a, b int) int {
 }
 
 type Server struct {
-	cfg        config.Config
-	upgrader   websocket.Upgrader
-	mu         sync.RWMutex
-	rooms      map[string]map[*websocket.Conn]*clientMeta
-	translator *translation.Client
+	cfg            config.Config
+	upgrader       websocket.Upgrader
+	mu             sync.RWMutex
+	rooms          map[string]map[*websocket.Conn]*clientMeta
+	translator     *translation.Client
+	engineProvider func() (weng.Engine, error)
+	engineMu       sync.Mutex
+	engine         weng.Engine
 }
 
 type clientMeta struct {
@@ -55,6 +58,10 @@ type clientMeta struct {
 }
 
 func NewServer(cfg config.Config) *Server {
+	return NewServerWithEngine(cfg, nil)
+}
+
+func NewServerWithEngine(cfg config.Config, engineProvider func() (weng.Engine, error)) *Server {
 	return &Server{
 		cfg: cfg,
 		upgrader: websocket.Upgrader{
@@ -62,9 +69,27 @@ func NewServer(cfg config.Config) *Server {
 			ReadBufferSize:  1024 * 16,
 			WriteBufferSize: 1024 * 16,
 		},
-		rooms:      make(map[string]map[*websocket.Conn]*clientMeta),
-		translator: translation.New(cfg.TranslationBaseURL, cfg.TranslationTimeoutSec),
+		rooms:          make(map[string]map[*websocket.Conn]*clientMeta),
+		translator:     translation.New(cfg.TranslationBaseURL, cfg.TranslationTimeoutSec),
+		engineProvider: engineProvider,
 	}
+}
+
+func (s *Server) ensureEngine() (weng.Engine, error) {
+	if s.engineProvider != nil {
+		return s.engineProvider()
+	}
+	s.engineMu.Lock()
+	defer s.engineMu.Unlock()
+	if s.engine != nil {
+		return s.engine, nil
+	}
+	created, err := weng.NewEngine(s.cfg.ModelPath)
+	if err != nil {
+		return nil, err
+	}
+	s.engine = created
+	return s.engine, nil
 }
 
 func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
@@ -306,7 +331,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 						return
 					case req := <-reqCh:
 						started := time.Now()
-						_, fullText, detectedLang, err := engine.Process(req.inferenceSamples)
+						_, fullText, detectedLang, err := engine.ProcessWithLanguage(req.inferenceSamples, sourceLanguage)
 						resp := inferenceResponse{
 							req:          req,
 							fullText:     strings.TrimSpace(fullText),
@@ -526,7 +551,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 
 						if resp.req.finalizeRequested {
 							if (fullTranscript == "" || isBlankAudioText(fullTranscript)) && len(resp.req.audioWithContext) >= minFinalizeInferenceSamples {
-								_, retryFullText, retryLang, retryErr := engine.Process(resp.req.audioWithContext)
+								_, retryFullText, retryLang, retryErr := engine.ProcessWithLanguage(resp.req.audioWithContext, sourceLanguage)
 								if retryErr != nil {
 									log.Warn().Err(retryErr).Msg("worker: finalize retry process failed")
 								} else {
@@ -773,18 +798,12 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 				s.leaveRoom(roomID, conn)
 				stopWorker()
 				<-resultWriterDone
-				if engine != nil {
-					_ = engine.Close()
-				}
 				return
 			}
 			log.Warn().Err(err).Msg("ws read error")
 			s.leaveRoom(roomID, conn)
 			stopWorker()
 			<-resultWriterDone
-			if engine != nil {
-				_ = engine.Close()
-			}
 			return
 		}
 		// Bump read deadline on any activity
@@ -828,11 +847,6 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 				Strs("target_langs", targetLanguages).
 				Int("alternatives", translationAlternatives).
 				Msg("session started with configuration")
-
-			// Configure engine language if already initialized
-			if engine != nil && sourceLanguage != "" {
-				engine.SetLanguage(sourceLanguage)
-			}
 
 			_ = sendJSON(map[string]any{"type": "started"})
 		case "join_room":
@@ -925,6 +939,17 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 					}
 					continue
 				}
+				if finalizeRequested {
+					finalizeRequested = false
+					log.Debug().
+						Int("chunks_received", chunksReceived).
+						Int("chunk_samples", len(pcm)).
+						Float64("rms", rms).
+						Float64("peak", peak).
+						Str("room_id", roomID).
+						Str("peer_id", meta.peerID).
+						Msg("canceled pending finalize because speech resumed")
+				}
 				samplesMu.Lock()
 				samples = append(samples, pcm...)
 
@@ -968,12 +993,8 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			// Lazy engine init
 			if engine == nil {
 				log.Info().Msg("initializing whisper engine...")
-				if e, err := weng.NewEngine(s.cfg.ModelPath); err == nil {
+				if e, err := s.ensureEngine(); err == nil {
 					engine = e
-					// Configure language if already set via start event
-					if sourceLanguage != "" {
-						engine.SetLanguage(sourceLanguage)
-					}
 					log.Info().Str("language", sourceLanguage).Msg("whisper engine initialized successfully")
 				} else {
 					log.Error().Err(err).Msg("engine init failed")
@@ -995,9 +1016,6 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			s.leaveRoom(roomID, conn)
 			stopWorker()
 			<-resultWriterDone
-			if engine != nil {
-				_ = engine.Close()
-			}
 			return
 		case "finalize":
 			finalizeRequested = true

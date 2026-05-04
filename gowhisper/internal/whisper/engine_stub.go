@@ -10,6 +10,9 @@ func (e *stubEngine) Close() error               { return nil }
 func (e *stubEngine) Process(samples []float32) (string, string, string, error) {
 	return "", "", "", nil
 }
+func (e *stubEngine) ProcessWithLanguage(samples []float32, lang string) (string, string, string, error) {
+	return "", "", "", nil
+}
 func (e *stubEngine) Stream(samples []float32, onSegment func(text string, lang string)) error {
 	return nil
 }

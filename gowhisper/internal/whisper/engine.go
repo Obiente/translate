@@ -6,6 +6,9 @@ type Engine interface {
 	// Process runs transcription over the provided PCM32F samples.
 	// Returns (deltaText, fullText, language).
 	Process(samples []float32) (string, string, string, error)
+	// ProcessWithLanguage runs transcription with a per-call language.
+	// Use "auto" or "" for auto-detection.
+	ProcessWithLanguage(samples []float32, lang string) (string, string, string, error)
 	// Stream runs transcription and calls back for each new segment as it becomes available.
 	// The callback should be fast and non-blocking to avoid stalling decoding.
 	Stream(samples []float32, onSegment func(text string, lang string)) error
