@@ -257,6 +257,8 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			type inferenceRequest struct {
 				id                int64
 				totalSamples      int
+				bufferSamples     int
+				caughtUp          bool
 				audioWithContext  []float32
 				inferenceSamples  []float32
 				windowRMS         float64
@@ -292,6 +294,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			const liveInferenceWindowSamples = 16000 * 2 // 2 seconds for low-latency partials
 			const maxWindowSamples = 16000 * 8           // 8 seconds rolling utterance window
 			const keepRecentSamples = 16000 * 3          // 3 seconds context after a final
+			const contextOverlapSamples = 16000          // 1 second overlap between catch-up windows
 
 			reqCh := make(chan inferenceRequest, 1)
 			respCh := make(chan inferenceResponse, 1)
@@ -354,6 +357,9 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 					log.Debug().
 						Dur("elapsed", resp.elapsed).
 						Int("samples", len(resp.req.inferenceSamples)).
+						Int("processed_until", resp.req.totalSamples).
+						Int("buffer_samples", resp.req.bufferSamples).
+						Bool("caught_up", resp.req.caughtUp).
 						Bool("finalize", resp.req.finalizeRequested).
 						Int64("request_id", resp.req.id).
 						Msg("worker: inference complete")
@@ -562,8 +568,16 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 						}
 
 						if result.isFinal {
+							nextLastSampleCount := 0
 							samplesMu.Lock()
-							if len(samples) > keepRecentSamples {
+							if resp.req.totalSamples < len(samples) {
+								// Keep any audio that arrived while this inference was running.
+								// Without this, a final result from an older window can trim away
+								// backlog and permanently drop part of the conversation.
+								contextStart := max(0, resp.req.totalSamples-keepRecentSamples)
+								samples = append([]float32(nil), samples[contextStart:]...)
+								nextLastSampleCount = resp.req.totalSamples - contextStart
+							} else if len(samples) > keepRecentSamples {
 								samples = append([]float32(nil), samples[len(samples)-keepRecentSamples:]...)
 							} else {
 								samples = append([]float32(nil), samples...)
@@ -573,7 +587,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 							fullTranscript = ""
 							finalizedText = ""
 							confirmedPrefix = ""
-							lastSampleCount = 0
+							lastSampleCount = nextLastSampleCount
 							repeatedTranscriptCount = 0
 							lastRepeatedTranscript = ""
 						} else {
@@ -658,18 +672,29 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 					newSamplesCount = totalSamples
 				}
 
-				startOffset := 0
-				if totalSamples > maxWindowSamples {
-					startOffset = totalSamples - maxWindowSamples
+				targetSamples := totalSamples
+				if newSamplesCount > maxWindowSamples {
+					targetSamples = lastSampleCount + maxWindowSamples
+				} else if !finalizeRequested {
+					windowSamples := liveInferenceWindowSamples
+					targetSamples = min(totalSamples, lastSampleCount+windowSamples)
 				}
 
-				audioWithContext := make([]float32, totalSamples-startOffset)
-				copy(audioWithContext, samples[startOffset:totalSamples])
+				startOffset := max(0, lastSampleCount-contextOverlapSamples)
+				if targetSamples-startOffset > maxWindowSamples {
+					startOffset = targetSamples - maxWindowSamples
+				}
+
+				audioWithContext := make([]float32, targetSamples-startOffset)
+				copy(audioWithContext, samples[startOffset:targetSamples])
 				samplesMu.Unlock()
 
 				audioDuration := float64(len(audioWithContext)) / 16000.0
-				newDuration := float64(newSamplesCount) / 16000.0
+				requestedNewSamples := targetSamples - lastSampleCount
+				newDuration := float64(requestedNewSamples) / 16000.0
 				windowRMS, windowPeak := audio.SignalStats(audioWithContext)
+				requestCaughtUp := targetSamples == totalSamples
+				requestFinalize := finalizeRequested && requestCaughtUp
 
 				hasLiveHypothesis := strings.TrimSpace(fullTranscript) != "" || strings.TrimSpace(lastPartialText) != ""
 
@@ -677,7 +702,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 				// the UI can track the sentence in motion. We are stricter about
 				// the very first hypothesis than we are about updates to an
 				// existing live hypothesis.
-				if !finalizeRequested && newSamplesCount < minStepSamples {
+				if !finalizeRequested && requestedNewSamples < minStepSamples {
 					time.Sleep(workTick)
 					continue
 				}
@@ -687,19 +712,21 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 				}
 
 				inferenceSamples := audioWithContext
-				if !finalizeRequested && len(inferenceSamples) > liveInferenceWindowSamples {
+				if !finalizeRequested && requestCaughtUp && len(inferenceSamples) > liveInferenceWindowSamples {
 					inferenceSamples = inferenceSamples[len(inferenceSamples)-liveInferenceWindowSamples:]
 				}
 
 				nextRequestID++
 				req := inferenceRequest{
 					id:                nextRequestID,
-					totalSamples:      totalSamples,
+					totalSamples:      targetSamples,
+					bufferSamples:     totalSamples,
+					caughtUp:          requestCaughtUp,
 					audioWithContext:  append([]float32(nil), audioWithContext...),
 					inferenceSamples:  append([]float32(nil), inferenceSamples...),
 					windowRMS:         windowRMS,
 					windowPeak:        windowPeak,
-					finalizeRequested: finalizeRequested,
+					finalizeRequested: requestFinalize,
 				}
 
 				if inFlightReq != nil &&
@@ -719,10 +746,12 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 				log.Debug().
 					Int("new_samples", newSamplesCount).
 					Int("total_with_context", len(audioWithContext)).
-					Int("total_samples", totalSamples).
+					Int("processed_until", targetSamples).
+					Int("buffer_samples", totalSamples).
 					Float64("context_duration", audioDuration).
 					Float64("new_duration", newDuration).
-					Bool("finalize", finalizeRequested).
+					Bool("caught_up", requestCaughtUp).
+					Bool("finalize", requestFinalize).
 					Msg("worker: queued audio for inference")
 
 				if !inFlight {
@@ -899,17 +928,23 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 				samplesMu.Lock()
 				samples = append(samples, pcm...)
 
-				// Keep reasonable buffer size - use rolling 90s window for 1 minute context + 30s overflow
-				// This allows whisper to correct itself and finalize sentences properly
+				// Keep a rolling buffer, but only trim audio the worker has
+				// already processed. If Whisper falls behind, trimming
+				// unprocessed samples here would silently drop conversation.
 				const maxBufferSamples = 90 * 16000 // 90 seconds at 16kHz
 				if len(samples) > maxBufferSamples {
-					// Discard oldest 30 seconds when buffer is full
-					discardSamples := 30 * 16000
-					samples = samples[discardSamples:]
-					if lastSampleCount > discardSamples {
+					excessSamples := len(samples) - maxBufferSamples
+					processedTrimLimit := max(0, lastSampleCount-(3*16000))
+					discardSamples := min(max(excessSamples, 30*16000), processedTrimLimit)
+					if discardSamples > 0 {
+						samples = samples[discardSamples:]
 						lastSampleCount -= discardSamples
 					} else {
-						lastSampleCount = 0
+						log.Warn().
+							Int("buffer_samples", len(samples)).
+							Int("last_sample_count", lastSampleCount).
+							Float64("buffer_seconds", float64(len(samples))/16000.0).
+							Msg("audio buffer over target; preserving unprocessed backlog")
 					}
 					log.Debug().Int("buffer_samples", len(samples)).Float64("buffer_seconds", float64(len(samples))/16000.0).Msg("trimmed buffer (rolling 90s window)")
 				}
