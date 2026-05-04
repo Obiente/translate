@@ -104,6 +104,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 	conn.SetPongHandler(func(string) error { _ = conn.SetReadDeadline(time.Now().Add(60 * time.Second)); return nil })
 
 	// session state
+	const finalizeQuietPeriod = 1500 * time.Millisecond
 	var (
 		roomID         string
 		meta           = &clientMeta{}
@@ -708,10 +709,12 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 					newSamplesCount = totalSamples
 				}
 
+				hasLiveHypothesis := strings.TrimSpace(fullTranscript) != "" || strings.TrimSpace(lastPartialText) != ""
+
 				targetSamples := totalSamples
 				if newSamplesCount > maxWindowSamples {
 					targetSamples = lastSampleCount + maxWindowSamples
-				} else if !finalizeRequested {
+				} else {
 					windowSamples := liveInferenceWindowSamples
 					targetSamples = min(totalSamples, lastSampleCount+windowSamples)
 				}
@@ -730,25 +733,27 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 				newDuration := float64(requestedNewSamples) / 16000.0
 				windowRMS, windowPeak := audio.SignalStats(audioWithContext)
 				requestCaughtUp := targetSamples == totalSamples
-				requestFinalize := finalizeRequested && requestCaughtUp
-
-				hasLiveHypothesis := strings.TrimSpace(fullTranscript) != "" || strings.TrimSpace(lastPartialText) != ""
+				quietFor := time.Duration(0)
+				if !lastSpeechAt.IsZero() {
+					quietFor = time.Since(lastSpeechAt)
+				}
+				requestFinalize := finalizeRequested && requestCaughtUp && quietFor >= finalizeQuietPeriod
 
 				// Keep feeding audio into Whisper while the speaker is talking so
 				// the UI can track the sentence in motion. We are stricter about
 				// the very first hypothesis than we are about updates to an
 				// existing live hypothesis.
-				if !finalizeRequested && requestedNewSamples < minStepSamples {
+				if !requestFinalize && requestedNewSamples < minStepSamples {
 					time.Sleep(workTick)
 					continue
 				}
-				if !finalizeRequested && !hasLiveHypothesis && len(audioWithContext) < minLiveInferenceSamples {
+				if !requestFinalize && !hasLiveHypothesis && len(audioWithContext) < minLiveInferenceSamples {
 					time.Sleep(workTick)
 					continue
 				}
 
 				inferenceSamples := audioWithContext
-				if !finalizeRequested && requestCaughtUp && len(inferenceSamples) > liveInferenceWindowSamples {
+				if !requestFinalize && requestCaughtUp && len(inferenceSamples) > liveInferenceWindowSamples {
 					inferenceSamples = inferenceSamples[len(inferenceSamples)-liveInferenceWindowSamples:]
 				}
 
@@ -786,6 +791,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 					Int("buffer_samples", totalSamples).
 					Float64("context_duration", audioDuration).
 					Float64("new_duration", newDuration).
+					Dur("quiet_for", quietFor).
 					Bool("caught_up", requestCaughtUp).
 					Bool("finalize", requestFinalize).
 					Msg("worker: queued audio for inference")
@@ -1031,7 +1037,6 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			<-resultWriterDone
 			return
 		case "finalize":
-			const finalizeQuietPeriod = 1500 * time.Millisecond
 			if !lastSpeechAt.IsZero() && time.Since(lastSpeechAt) < finalizeQuietPeriod {
 				finalizeAfter = lastSpeechAt.Add(finalizeQuietPeriod)
 				log.Debug().
