@@ -16,6 +16,7 @@ type Config struct {
 	EnginePoolSize        int
 	LiveWindowMs          int
 	MaxWindowMs           int
+	RealtimeMaxLagMs      int
 }
 
 func getenv(key, def string) string {
@@ -58,5 +59,6 @@ func Load() Config {
 		EnginePoolSize:        getenvInt("WHISPER_ENGINE_POOL_SIZE", 1),
 		LiveWindowMs:          getenvInt("WHISPER_LIVE_WINDOW_MS", 1000),
 		MaxWindowMs:           getenvInt("WHISPER_MAX_WINDOW_MS", 4000),
+		RealtimeMaxLagMs:      getenvInt("WHISPER_REALTIME_MAX_LAG_MS", 8000),
 	}
 }

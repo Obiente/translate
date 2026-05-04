@@ -337,11 +337,60 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			const minFinalizeInferenceSamples = 9600 // 600ms before trusting finalize retry
 			liveInferenceWindowSamples := max(8000, s.cfg.LiveWindowMs*16)
 			maxWindowSamples := max(liveInferenceWindowSamples, s.cfg.MaxWindowMs*16)
+			realtimeMaxLag := time.Duration(s.cfg.RealtimeMaxLagMs) * time.Millisecond
 			const keepRecentSamples = 16000 * 2     // 2 seconds context after a final
 			const contextOverlapSamples = 16000 / 2 // 0.5 second overlap between catch-up windows
 
 			reqCh := make(chan inferenceRequest, 1)
 			respCh := make(chan inferenceResponse, 1)
+
+			fastForwardLiveBacklog := func(reason string) bool {
+				if realtimeMaxLag <= 0 {
+					return false
+				}
+
+				samplesMu.Lock()
+				defer samplesMu.Unlock()
+
+				totalSamples := len(samples)
+				backlogSamples := totalSamples - lastSampleCount
+				if backlogSamples <= maxWindowSamples {
+					return false
+				}
+
+				targetLastSampleCount := max(0, totalSamples-liveInferenceWindowSamples)
+				trimSamples := max(0, targetLastSampleCount-keepRecentSamples)
+				if trimSamples > 0 {
+					samples = append([]float32(nil), samples[trimSamples:]...)
+					audioStartAt = audioStartAt.Add(time.Duration(trimSamples) * time.Second / 16000)
+					totalSamples -= trimSamples
+					targetLastSampleCount -= trimSamples
+				}
+
+				lastSampleCount = targetLastSampleCount
+				fullTranscript = ""
+				lastPartialText = ""
+				confirmedPrefix = ""
+				finalizedText = ""
+				finalizeRequested = false
+				finalizeAfter = time.Time{}
+				repeatedTranscriptCount = 0
+				lastRepeatedTranscript = ""
+				stableTextCount = 0
+				lastStableText = ""
+
+				log.Warn().
+					Str("reason", reason).
+					Int("backlog_samples", backlogSamples).
+					Float64("backlog_seconds", float64(backlogSamples)/16000.0).
+					Int("last_sample_count", lastSampleCount).
+					Int("buffer_samples", totalSamples).
+					Float64("buffer_seconds", float64(totalSamples)/16000.0).
+					Str("room_id", roomID).
+					Str("peer_id", meta.peerID).
+					Msg("worker: fast-forwarded stale live audio backlog")
+				return true
+			}
 
 			go func() {
 				for {
@@ -692,6 +741,17 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 						Str("full_text", fullTranscript).
 						Bool("is_final", result.isFinal).
 						Msg("worker: chunk complete")
+
+					if pendingReq != nil && !resp.req.finalizeRequested && realtimeMaxLag > 0 {
+						backlogSamples := pendingReq.bufferSamples - resp.req.totalSamples
+						backlogDuration := time.Duration(backlogSamples) * time.Second / 16000
+						if resp.elapsed > realtimeMaxLag || backlogDuration > realtimeMaxLag {
+							pendingReq = nil
+							if fastForwardLiveBacklog("live inference exceeded realtime lag budget") {
+								continue
+							}
+						}
+					}
 
 					if pendingReq != nil {
 						req := *pendingReq
