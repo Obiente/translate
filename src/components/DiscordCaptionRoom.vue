@@ -92,7 +92,7 @@
       </header>
       <ol v-if="timeline.length">
         <li v-for="item in timeline" :key="item.key">
-          <span>{{ item.time }}</span>
+          <span>{{ item.spokenAgo || item.time }}</span>
           <strong>{{ item.label }}</strong>
           <p>{{ item.translation || item.transcript }}</p>
         </li>
@@ -230,6 +230,7 @@ const speakerCards = computed(() => {
         translation: translations.map((item) => `${item.lang}: ${item.text}`).join(" / "),
         isActive: Number.isFinite(timestamp) && Date.now() - timestamp < ACTIVE_WINDOW_MS,
         timestamp,
+        spokenAt: entry.spokenAt,
       };
     })
     .sort((a, b) => b.timestamp - a.timestamp);
@@ -249,6 +250,7 @@ const timeline = computed(() =>
         hour: "2-digit",
         minute: "2-digit",
       }),
+      spokenAgo: relativeSpokenTime(entry.spokenAt),
     })),
 );
 
@@ -266,6 +268,17 @@ function allTranslations(entry: RoomTranscript): Array<{ lang: string; text: str
       return { lang, text };
     })
     .filter((item) => item.text);
+}
+
+function relativeSpokenTime(spokenAt?: string): string {
+  if (!spokenAt) return "";
+  const spokenMs = Date.parse(spokenAt);
+  if (!Number.isFinite(spokenMs)) return "";
+  const seconds = Math.max(0, Math.round((Date.now() - spokenMs) / 1000));
+  if (seconds < 5) return "just now";
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.round(seconds / 60);
+  return `${minutes}m ago`;
 }
 
 function speakerKey(entry: RoomTranscript): string {

@@ -125,6 +125,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 		finalizedText     string                // text already finalized for current utterance
 		confirmedPrefix   string                // confirmed sentence prefix retained across recalculations
 		lastPartialText   string                // most recent live text tail
+		audioStartAt      time.Time             // estimated wall-clock time of samples[0]
 		lastSampleCount   int                   // sample count at last inference pass
 		workerStarted     bool                  // track if background worker is running
 		samplesMu         sync.Mutex            // protect samples buffer
@@ -147,6 +148,13 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 		writeMu.Lock()
 		defer writeMu.Unlock()
 		return conn.WriteJSON(payload)
+	}
+
+	spokenAtForSamples := func(sampleCount int) time.Time {
+		if audioStartAt.IsZero() || sampleCount <= 0 {
+			return time.Time{}
+		}
+		return audioStartAt.Add(time.Duration(sampleCount) * time.Second / 16000)
 	}
 
 	dumpCurrentAudio := func(tag string) {
@@ -199,6 +207,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 		lang     string
 		isFinal  bool
 		sequence int
+		spokenAt time.Time
 		trans    map[string]any
 	}
 	resCh := make(chan transcriptResult, 16) // Buffer for parallel results
@@ -226,6 +235,9 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			"sequence":     r.sequence,
 			"translations": r.trans,
 		}
+		if !r.spokenAt.IsZero() {
+			payload["spokenAt"] = r.spokenAt.Format(time.RFC3339Nano)
+		}
 		if err := sendJSON(payload); err != nil {
 			log.Warn().Err(err).Msg("failed to send transcript")
 		} else {
@@ -246,6 +258,10 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 				"isFinal":         r.isFinal,
 				"sequence":        r.sequence,
 				"translations":    r.trans,
+			}
+			if !r.spokenAt.IsZero() {
+				rp["spoken_at"] = r.spokenAt.Format(time.RFC3339Nano)
+				rp["spokenAt"] = r.spokenAt.Format(time.RFC3339Nano)
 			}
 			s.broadcast(roomID, conn, meta.peerID, rp)
 		}
@@ -420,11 +436,12 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 						Int64("request_id", resp.req.id).
 						Msg("worker: inference complete")
 
-					// Build result
+						// Build result
 					result := transcriptResult{
 						lang:     resp.detectedLang,
 						isFinal:  false,
 						sequence: seq,
+						spokenAt: spokenAtForSamples(resp.req.totalSamples),
 						trans:    map[string]any{},
 					}
 					if result.lang == "" {
@@ -645,9 +662,12 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 								// backlog and permanently drop part of the conversation.
 								contextStart := max(0, resp.req.totalSamples-keepRecentSamples)
 								samples = append([]float32(nil), samples[contextStart:]...)
+								audioStartAt = audioStartAt.Add(time.Duration(contextStart) * time.Second / 16000)
 								nextLastSampleCount = resp.req.totalSamples - contextStart
 							} else if len(samples) > keepRecentSamples {
-								samples = append([]float32(nil), samples[len(samples)-keepRecentSamples:]...)
+								trimSamples := len(samples) - keepRecentSamples
+								samples = append([]float32(nil), samples[trimSamples:]...)
+								audioStartAt = audioStartAt.Add(time.Duration(trimSamples) * time.Second / 16000)
 							} else {
 								samples = append([]float32(nil), samples...)
 							}
@@ -973,6 +993,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			// Append to session buffer
 			if len(pcm) > 0 {
 				chunksReceived++
+				receivedAt := time.Now()
 				rms, peak := audio.SignalStats(pcm)
 				isSilentChunk := rms < 0.0005 && peak < 0.002
 				if isSilentChunk {
@@ -1000,8 +1021,11 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 						Str("peer_id", meta.peerID).
 						Msg("canceled pending finalize because speech resumed")
 				}
-				lastSpeechAt = time.Now()
+				lastSpeechAt = receivedAt
 				samplesMu.Lock()
+				if audioStartAt.IsZero() {
+					audioStartAt = receivedAt.Add(-time.Duration(len(pcm)) * time.Second / 16000)
+				}
 				samples = append(samples, pcm...)
 
 				// Keep a rolling buffer, but only trim audio the worker has
@@ -1014,6 +1038,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 					discardSamples := min(max(excessSamples, 30*16000), processedTrimLimit)
 					if discardSamples > 0 {
 						samples = samples[discardSamples:]
+						audioStartAt = audioStartAt.Add(time.Duration(discardSamples) * time.Second / 16000)
 						lastSampleCount -= discardSamples
 					} else {
 						log.Warn().

@@ -14,6 +14,7 @@ export interface RoomTranscript {
   translations?: Record<string, any>;
   sequence?: number;
   timestamp: string;
+  spokenAt?: string;
 }
 
 type RoomStatus = 'idle' | 'connecting' | 'connected' | 'error';
@@ -175,6 +176,7 @@ export const useRoomManager = () => {
             translations: (payload.translations && typeof payload.translations === 'object') ? payload.translations : undefined,
             sequence: typeof payload.sequence === 'number' ? payload.sequence : undefined,
             timestamp: new Date().toISOString(),
+            spokenAt: typeof payload.spoken_at === 'string' ? payload.spoken_at : (typeof payload.spokenAt === 'string' ? payload.spokenAt : undefined),
           };
           if (entry.isFinal) {
             const speakerKey = entry.channelId || entry.peerId || 'speaker';
