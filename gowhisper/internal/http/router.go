@@ -33,7 +33,7 @@ func NewRouter() http.Handler {
 		if engine != nil {
 			return engine, nil
 		}
-		created, err := weng.NewEngine(cfg.ModelPath)
+		created, err := weng.NewEnginePool(cfg.ModelPath, cfg.EnginePoolSize)
 		if err != nil {
 			return nil, err
 		}

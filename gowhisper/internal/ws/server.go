@@ -84,7 +84,7 @@ func (s *Server) ensureEngine() (weng.Engine, error) {
 	if s.engine != nil {
 		return s.engine, nil
 	}
-	created, err := weng.NewEngine(s.cfg.ModelPath)
+	created, err := weng.NewEnginePool(s.cfg.ModelPath, s.cfg.EnginePoolSize)
 	if err != nil {
 		return nil, err
 	}
