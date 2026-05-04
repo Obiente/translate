@@ -558,28 +558,6 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 							log.Info().Str("text", fullTranscript).Msg("worker: auto-final triggered by repeated transcript")
 						}
 
-						shouldTranslate := s.cfg.TranslationEnabled &&
-							len(targetLanguages) > 0 &&
-							result.delta != "" &&
-							(result.isFinal || s.cfg.TranslatePartials)
-						if shouldTranslate {
-							ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.cfg.TranslationTimeoutSec)*time.Second)
-							alts := translationAlternatives
-							if alts < 0 {
-								alts = 0
-							}
-							if m, err := s.translator.Translate(ctx, result.delta, result.lang, targetLanguages, alts); err != nil {
-								log.Warn().Err(err).Str("delta", result.delta).Msg("worker: translation request failed")
-							} else if m == nil || len(m) == 0 {
-								log.Debug().Str("delta", result.delta).Msg("worker: translation returned no results")
-							} else {
-								for k, v := range m {
-									result.trans[k] = v
-								}
-							}
-							cancel()
-						}
-
 						if resp.req.finalizeRequested {
 							if (fullTranscript == "" || isBlankAudioText(fullTranscript)) && len(resp.req.audioWithContext) >= minFinalizeInferenceSamples {
 								_, retryFullText, retryLang, retryErr := engine.ProcessWithLanguage(resp.req.audioWithContext, sourceLanguage)
@@ -611,6 +589,11 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 							log.Info().Str("text", fullTranscript).Msg("worker: promoting transcript to final after finalize request")
 						}
 
+						shouldTranslate := s.cfg.TranslationEnabled &&
+							len(targetLanguages) > 0 &&
+							result.delta != "" &&
+							(result.isFinal || s.cfg.TranslatePartials)
+
 						log.Debug().
 							Str("delta", result.delta).
 							Str("full", result.full[:min(100, len(result.full))]).
@@ -621,6 +604,36 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 						select {
 						case resCh <- result:
 						case <-time.After(1 * time.Second):
+						}
+
+						if shouldTranslate {
+							translateResult := result
+							translateResult.trans = map[string]any{}
+							go func() {
+								ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.cfg.TranslationTimeoutSec)*time.Second)
+								defer cancel()
+								alts := translationAlternatives
+								if alts < 0 {
+									alts = 0
+								}
+								m, err := s.translator.Translate(ctx, translateResult.delta, translateResult.lang, targetLanguages, alts)
+								if err != nil {
+									log.Warn().Err(err).Str("delta", translateResult.delta).Msg("worker: translation request failed")
+									return
+								}
+								if m == nil || len(m) == 0 {
+									log.Debug().Str("delta", translateResult.delta).Msg("worker: translation returned no results")
+									return
+								}
+								for k, v := range m {
+									translateResult.trans[k] = v
+								}
+								select {
+								case resCh <- translateResult:
+								case <-time.After(1 * time.Second):
+								case <-exitWorker:
+								}
+							}()
 						}
 
 						if result.isFinal {
