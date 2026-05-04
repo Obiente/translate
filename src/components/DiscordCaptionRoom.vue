@@ -260,14 +260,73 @@ function bestTranslation(entry: RoomTranscript): string {
 
 function allTranslations(entry: RoomTranscript): Array<{ lang: string; text: string }> {
   if (!entry.translations) return [];
+  const original = entry.fullText || entry.text || "";
+  const originalLanguage = normalizeLanguageCode(entry.language);
+  const seen = new Set<string>();
+
   return Object.entries(entry.translations)
-    .map(([lang, value]) => {
+    .flatMap(([lang, value]) => {
+      const normalizedLang = normalizeLanguageCode(lang);
+      if (!normalizedLang || seen.has(normalizedLang)) return [];
       const text = typeof value === "string"
         ? value.trim()
         : String((value as { primary?: unknown })?.primary ?? "").trim();
-      return { lang, text };
+      if (!shouldShowTranslation(text, normalizedLang, originalLanguage, original)) return [];
+      seen.add(normalizedLang);
+      return [{ lang: normalizedLang, text }];
     })
-    .filter((item) => item.text);
+}
+
+function shouldShowTranslation(
+  text: string,
+  targetLanguage: string,
+  originalLanguage: string,
+  original: string,
+): boolean {
+  if (!text || isJunkTranscript(text)) return false;
+  if (targetLanguage && originalLanguage && targetLanguage === originalLanguage) {
+    return normalizeComparableText(text) !== normalizeComparableText(original);
+  }
+  return true;
+}
+
+function isJunkTranscript(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+  const normalized = trimmed.toUpperCase();
+  if (normalized === "[BLANK_AUDIO]" || normalized === "BLANK_AUDIO") return true;
+
+  const meaningful = Array.from(trimmed.replace(/[\s\p{P}\p{S}]/gu, ""));
+  if (meaningful.length === 0) return true;
+  if (meaningful.length >= 3 && new Set(meaningful).size === 1) return true;
+
+  const compact = meaningful.join("");
+  if (compact.length >= 4 && repeatedUnit(compact)) return true;
+
+  const words = trimmed
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]+/gu, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  return words.length >= 3 && new Set(words).size === 1;
+}
+
+function repeatedUnit(value: string): boolean {
+  for (let size = 1; size <= Math.floor(value.length / 2); size++) {
+    if (value.length % size !== 0) continue;
+    const unit = value.slice(0, size);
+    if (unit.repeat(value.length / size) === value) return true;
+  }
+  return false;
+}
+
+function normalizeLanguageCode(value: string | null | undefined): string {
+  return (value ?? "").trim().toLowerCase().split(/[-_]/)[0] ?? "";
+}
+
+function normalizeComparableText(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
 function relativeSpokenTime(spokenAt?: string): string {
