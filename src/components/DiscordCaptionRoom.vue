@@ -56,8 +56,18 @@
             <small>{{ speaker.meta }}</small>
           </div>
         </header>
-        <p class="speaker-translation">
-          {{ speaker.translation || speaker.transcript || "Listening..." }}
+        <div v-if="speaker.translations.length" class="speaker-translations">
+          <p
+            v-for="translation in speaker.translations"
+            :key="translation.lang"
+            class="speaker-translation"
+          >
+            <span>{{ translation.lang }}</span>
+            {{ translation.text }}
+          </p>
+        </div>
+        <p v-else class="speaker-translation">
+          {{ speaker.transcript || "Listening..." }}
         </p>
         <p class="speaker-source" v-if="speaker.translation && speaker.transcript">
           {{ speaker.transcript }}
@@ -207,6 +217,7 @@ const speakerCards = computed(() => {
     .map((entry) => {
       const label = speakerLabel(entry);
       const timestamp = Date.parse(entry.timestamp);
+      const translations = allTranslations(entry);
       return {
         id: speakerKey(entry),
         label,
@@ -215,7 +226,8 @@ const speakerCards = computed(() => {
         language: entry.language,
         meta: [entry.language || "auto", entry.isFinal ? "final" : "live"].join(" - "),
         transcript: entry.fullText || entry.text || "",
-        translation: bestTranslation(entry),
+        translations,
+        translation: translations.map((item) => `${item.lang}: ${item.text}`).join(" / "),
         isActive: Number.isFinite(timestamp) && Date.now() - timestamp < ACTIVE_WINDOW_MS,
         timestamp,
       };
@@ -232,7 +244,7 @@ const timeline = computed(() =>
       key: `${entry.peerId || entry.channelId || "speaker"}-${entry.sequence ?? index}-${entry.timestamp}`,
       label: speakerLabel(entry),
       transcript: entry.fullText || entry.text || "",
-      translation: bestTranslation(entry),
+      translation: allTranslations(entry).map((item) => `${item.lang}: ${item.text}`).join(" / "),
       time: new Date(entry.timestamp).toLocaleTimeString([], {
         hour: "2-digit",
         minute: "2-digit",
@@ -241,19 +253,19 @@ const timeline = computed(() =>
 );
 
 function bestTranslation(entry: RoomTranscript): string {
-  if (!entry.translations) return "";
-  const first = Object.values(entry.translations).find((value) => {
-    if (typeof value === "string") return value.trim();
-    if (value && typeof value === "object" && "primary" in value) {
-      return String((value as { primary?: unknown }).primary ?? "").trim();
-    }
-    return "";
-  });
-  if (typeof first === "string") return first.trim();
-  if (first && typeof first === "object" && "primary" in first) {
-    return String((first as { primary?: unknown }).primary ?? "").trim();
-  }
-  return "";
+  return allTranslations(entry)[0]?.text || "";
+}
+
+function allTranslations(entry: RoomTranscript): Array<{ lang: string; text: string }> {
+  if (!entry.translations) return [];
+  return Object.entries(entry.translations)
+    .map(([lang, value]) => {
+      const text = typeof value === "string"
+        ? value.trim()
+        : String((value as { primary?: unknown })?.primary ?? "").trim();
+      return { lang, text };
+    })
+    .filter((item) => item.text);
 }
 
 function speakerKey(entry: RoomTranscript): string {

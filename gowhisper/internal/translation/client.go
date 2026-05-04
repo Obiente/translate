@@ -126,14 +126,18 @@ func normalizeAlternatives(values []string, primary string) []string {
 	return out
 }
 
+func normalizeLang(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
 func (c *Client) TranslateOne(ctx context.Context, text string, source string, target string, altLimit int) (TranslationEntry, error) {
 	if c == nil || strings.TrimSpace(c.base) == "" {
 		return TranslationEntry{}, nil
 	}
 
 	text = strings.TrimSpace(text)
-	target = strings.TrimSpace(target)
-	source = strings.TrimSpace(source)
+	target = normalizeLang(target)
+	source = normalizeLang(source)
 	if source == "" {
 		source = "auto"
 	}
@@ -195,6 +199,10 @@ func (c *Client) TranslateOne(ctx context.Context, text string, source string, t
 		Alternatives:     normalizeAlternatives(lr.Alternatives, lr.TranslatedText),
 		DetectedLanguage: decodeDetectedLanguage(lr.DetectedLanguage),
 	}
+	if normalizeLang(entry.DetectedLanguage) == target {
+		entry.Primary = text
+		entry.Alternatives = []string{}
+	}
 	c.cache.Store(key, entry)
 	return entry, nil
 }
@@ -216,7 +224,7 @@ func (c *Client) Translate(ctx context.Context, text string, source string, targ
 	seen := make(map[string]bool, len(targets))
 
 	for _, rawTarget := range targets {
-		tgt := strings.TrimSpace(rawTarget)
+		tgt := normalizeLang(rawTarget)
 		if tgt == "" || seen[tgt] {
 			continue
 		}
