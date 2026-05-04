@@ -334,7 +334,26 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 						return
 					case req := <-reqCh:
 						started := time.Now()
+						done := make(chan struct{})
+						go func(req inferenceRequest) {
+							timer := time.NewTimer(2 * time.Second)
+							defer timer.Stop()
+							select {
+							case <-done:
+							case <-exitWorker:
+							case <-timer.C:
+								log.Warn().
+									Int64("request_id", req.id).
+									Int("samples", len(req.inferenceSamples)).
+									Int("processed_until", req.totalSamples).
+									Int("buffer_samples", req.bufferSamples).
+									Bool("caught_up", req.caughtUp).
+									Bool("finalize", req.finalizeRequested).
+									Msg("worker: whisper inference still running after 2s")
+							}
+						}(req)
 						_, fullText, detectedLang, err := engine.ProcessWithLanguage(req.inferenceSamples, sourceLanguage)
+						close(done)
 						resp := inferenceResponse{
 							req:          req,
 							fullText:     strings.TrimSpace(fullText),

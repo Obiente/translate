@@ -3,6 +3,8 @@ package whisper
 import (
 	"fmt"
 	"sync/atomic"
+
+	"github.com/rs/zerolog/log"
 )
 
 // Engine is a small interface for whisper transcription.
@@ -32,8 +34,10 @@ type enginePool struct {
 
 func NewEnginePool(modelPath string, size int) (Engine, error) {
 	if size <= 1 {
+		log.Info().Int("pool_size", 1).Msg("whisper: creating engine pool")
 		return NewEngine(modelPath)
 	}
+	log.Info().Int("pool_size", size).Msg("whisper: creating engine pool")
 	engines := make([]Engine, 0, size)
 	for i := 0; i < size; i++ {
 		engine, err := NewEngine(modelPath)
