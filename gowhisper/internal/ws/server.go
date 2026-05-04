@@ -130,6 +130,8 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 		exitWorker        = make(chan struct{}) // signal worker to exit
 		stopWorkerOnce    sync.Once
 		finalizeRequested bool
+		finalizeAfter     time.Time
+		lastSpeechAt      time.Time
 		dumpCount         int
 	)
 	meta.writeMu = &writeMu
@@ -359,6 +361,15 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			}
 
 			for {
+				if !finalizeRequested && !finalizeAfter.IsZero() && !time.Now().Before(finalizeAfter) {
+					finalizeRequested = true
+					finalizeAfter = time.Time{}
+					log.Debug().
+						Str("room_id", roomID).
+						Str("peer_id", meta.peerID).
+						Msg("worker: applying deferred finalize after quiet period")
+				}
+
 				select {
 				case <-exitWorker:
 					return
@@ -941,6 +952,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 				}
 				if finalizeRequested {
 					finalizeRequested = false
+					finalizeAfter = time.Time{}
 					log.Debug().
 						Int("chunks_received", chunksReceived).
 						Int("chunk_samples", len(pcm)).
@@ -950,6 +962,7 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 						Str("peer_id", meta.peerID).
 						Msg("canceled pending finalize because speech resumed")
 				}
+				lastSpeechAt = time.Now()
 				samplesMu.Lock()
 				samples = append(samples, pcm...)
 
@@ -1018,7 +1031,18 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			<-resultWriterDone
 			return
 		case "finalize":
-			finalizeRequested = true
+			const finalizeQuietPeriod = 1500 * time.Millisecond
+			if !lastSpeechAt.IsZero() && time.Since(lastSpeechAt) < finalizeQuietPeriod {
+				finalizeAfter = lastSpeechAt.Add(finalizeQuietPeriod)
+				log.Debug().
+					Dur("delay", time.Until(finalizeAfter)).
+					Str("room_id", roomID).
+					Str("peer_id", meta.peerID).
+					Msg("deferred finalize until speech has been quiet")
+			} else {
+				finalizeRequested = true
+				finalizeAfter = time.Time{}
+			}
 			_ = sendJSON(map[string]any{"type": "finalizing"})
 		default:
 			_ = sendJSON(map[string]any{"type": "error", "detail": "unknown message type"})
