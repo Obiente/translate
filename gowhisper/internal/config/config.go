@@ -14,6 +14,8 @@ type Config struct {
 	TranslationTimeoutSec int
 	DebugDumpDir          string
 	EnginePoolSize        int
+	LiveWindowMs          int
+	MaxWindowMs           int
 }
 
 func getenv(key, def string) string {
@@ -54,5 +56,7 @@ func Load() Config {
 		TranslationTimeoutSec: getenvInt("TRANSLATION_TIMEOUT", 8),
 		DebugDumpDir:          getenv("WHISPER_SERVER_DEBUG_DUMP_DIR", ""),
 		EnginePoolSize:        getenvInt("WHISPER_ENGINE_POOL_SIZE", 1),
+		LiveWindowMs:          getenvInt("WHISPER_LIVE_WINDOW_MS", 1000),
+		MaxWindowMs:           getenvInt("WHISPER_MAX_WINDOW_MS", 4000),
 	}
 }

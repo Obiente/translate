@@ -316,13 +316,13 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 			const stableThreshold = 2          // Number of passes before marking as final
 			const autoFinalRepeatThreshold = 2 // Repeated identical transcript triggers a final
 			const workTick = 100 * time.Millisecond
-			const minStepSamples = 1600                  // 100ms at 16kHz for steady partial updates
-			const minLiveInferenceSamples = 6400         // 400ms before first live hypothesis
-			const minFinalizeInferenceSamples = 9600     // 600ms before trusting finalize retry
-			const liveInferenceWindowSamples = 16000 * 2 // 2 seconds for low-latency partials
-			const maxWindowSamples = 16000 * 8           // 8 seconds rolling utterance window
-			const keepRecentSamples = 16000 * 3          // 3 seconds context after a final
-			const contextOverlapSamples = 16000          // 1 second overlap between catch-up windows
+			const minStepSamples = 1600              // 100ms at 16kHz for steady partial updates
+			const minLiveInferenceSamples = 8000     // 500ms before first live hypothesis
+			const minFinalizeInferenceSamples = 9600 // 600ms before trusting finalize retry
+			liveInferenceWindowSamples := max(8000, s.cfg.LiveWindowMs*16)
+			maxWindowSamples := max(liveInferenceWindowSamples, s.cfg.MaxWindowMs*16)
+			const keepRecentSamples = 16000 * 2     // 2 seconds context after a final
+			const contextOverlapSamples = 16000 / 2 // 0.5 second overlap between catch-up windows
 
 			reqCh := make(chan inferenceRequest, 1)
 			respCh := make(chan inferenceResponse, 1)

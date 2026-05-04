@@ -153,8 +153,8 @@ func (e *EngineCPP) streamWithLanguage(samples []float32, language string, onSeg
 	}
 	ctx.SetThreads(e.threads)
 	_ = ctx.SetLanguage(language)
-	ctx.SetSplitOnWord(true)
-	ctx.SetTokenTimestamps(true)
+	ctx.SetSplitOnWord(false)
+	ctx.SetTokenTimestamps(false)
 	ctx.SetMaxSegmentLength(0)
 	ctx.SetMaxTokensPerSegment(0)
 	ctx.SetAudioCtx(0)
@@ -263,8 +263,8 @@ func (e *EngineCPP) ProcessWithLanguage(samples []float32, language string) (del
 	// Configure context for optimal streaming performance
 	ctx.SetThreads(e.threads)
 	ctx.SetLanguage(language)     // Use configured language
-	ctx.SetSplitOnWord(true)      // Split on word boundaries for better streaming
-	ctx.SetTokenTimestamps(true)  // Enable timestamps for better segmentation
+	ctx.SetSplitOnWord(false)     // Keep live decoding fast
+	ctx.SetTokenTimestamps(false) // Token timestamps are expensive and unused
 	ctx.SetMaxSegmentLength(0)    // No artificial limit on segment length
 	ctx.SetMaxTokensPerSegment(0) // No token limit
 	ctx.SetAudioCtx(0)            // Use full audio context
